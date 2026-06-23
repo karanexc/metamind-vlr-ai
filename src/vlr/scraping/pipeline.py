@@ -2,10 +2,10 @@
 from __future__ import annotations
 
 import logging
-import re
 from typing import Iterable, Optional
 
 from bs4 import BeautifulSoup
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..config import settings
@@ -31,6 +31,10 @@ from .parsers import (
 
 log = logging.getLogger(__name__)
 
+# Words that are status badges rather than real event names. Used to decide
+# whether to overwrite an existing Event.name in the DB.
+_BAD_EVENT_NAMES = {"upcoming", "completed", "live", "final", "tbd", ""}
+
 
 # --- Fetchers --------------------------------------------------------------
 
@@ -45,7 +49,6 @@ def fetch_results_page(page: int = 1) -> list[MatchListing]:
 
 
 def fetch_event_matches(event_id: int) -> list[MatchListing]:
-    """Fetch all match links from an event's matches page."""
     url = f"{settings.vlr_base_url}/event/matches/{event_id}/?series_id=all"
     html = fetch(url)
     return parse_results_listing(html, base_url=settings.vlr_base_url)
@@ -57,11 +60,6 @@ def fetch_and_parse_match(url: str) -> MatchDetail:
 
 
 def discover_events(search: Optional[str] = None, limit: int = 25) -> list[tuple[int, str]]:
-    """Scrape vlr.gg's /events page and return (event_id, name) pairs.
-
-    Optionally filter by case-insensitive substring match against the name.
-    Does NOT persist anything — purely a lookup helper for finding event IDs.
-    """
     url = f"{settings.vlr_base_url}/events"
     html = fetch(url)
     soup = BeautifulSoup(html, "lxml")
@@ -74,10 +72,8 @@ def discover_events(search: Optional[str] = None, limit: int = 25) -> list[tuple
         eid = int(m.group(1))
         if eid in seen:
             continue
-        # Prefer the longer, more descriptive name (skip empty anchors that
-        # just wrap an icon, etc.)
         name = " ".join(a.get_text().split())
-        if not name or len(name) < 3:
+        if not name or len(name) < 3 or name.lower() in _BAD_EVENT_NAMES:
             continue
         seen[eid] = name
 
@@ -92,8 +88,6 @@ def discover_events(search: Optional[str] = None, limit: int = 25) -> list[tuple
 
 
 def _team_id_for_player(detail: MatchDetail, ps: PlayerStat) -> int | None:
-    """Resolve a player's team_id via tbody position (most reliable), with
-    a fallback to matching the parsed short team tag against full names."""
     if ps.team_index == 0:
         return detail.team_a_id
     if ps.team_index == 1:
@@ -110,8 +104,26 @@ def _team_id_for_player(detail: MatchDetail, ps: PlayerStat) -> int | None:
     return None
 
 
+def _upsert_event(session: Session, event_id: int, parsed_name: Optional[str]) -> None:
+    """Insert event if missing, update its name if the parsed one is better."""
+    if event_id is None:
+        return
+    parsed_clean = (parsed_name or "").strip()
+    if not parsed_clean or parsed_clean.lower() in _BAD_EVENT_NAMES:
+        return  # nothing useful to write
+
+    event = session.get(Event, event_id)
+    if event is None:
+        session.add(Event(id=event_id, name=parsed_clean))
+        return
+
+    current = (event.name or "").strip().lower()
+    if current in _BAD_EVENT_NAMES or event.name != parsed_clean:
+        # Either current is junk or differs from the new parse — overwrite
+        event.name = parsed_clean
+
+
 def upsert_match(session: Session, detail: MatchDetail) -> Match:
-    """Persist a parsed match. Idempotent — wholesale replaces child rows."""
     # Teams
     for tid, tname in (
         (detail.team_a_id, detail.team_a_name),
@@ -120,12 +132,10 @@ def upsert_match(session: Session, detail: MatchDetail) -> Match:
         if tid is not None and not session.get(Team, tid):
             session.add(Team(id=tid, name=tname or ""))
 
-    # Event
-    if detail.event_id is not None and detail.event_name:
-        if not session.get(Event, detail.event_id):
-            session.add(Event(id=detail.event_id, name=detail.event_name))
+    # Event (insert or update name)
+    _upsert_event(session, detail.event_id, detail.event_name)
 
-    # Match (insert or update)
+    # Match
     match = session.get(Match, detail.match_id)
     if match is None:
         match = Match(id=detail.match_id, url=detail.url, team_a_name="", team_b_name="")
@@ -145,13 +155,11 @@ def upsert_match(session: Session, detail: MatchDetail) -> Match:
     match.match_datetime = detail.match_datetime
     match.veto_raw = detail.veto_raw
 
-    # Wipe child rows
     session.query(PlayerMapStat).filter(PlayerMapStat.match_id == detail.match_id).delete()
     session.query(MapPlayed).filter(MapPlayed.match_id == detail.match_id).delete()
     session.query(VetoAction).filter(VetoAction.match_id == detail.match_id).delete()
     session.flush()
 
-    # Re-insert maps and player stats
     for m in detail.maps:
         db_map = MapPlayed(
             match_id=detail.match_id,
@@ -209,9 +217,34 @@ def upsert_match(session: Session, detail: MatchDetail) -> Match:
 # --- High-level scraping -------------------------------------------------
 
 
-def _scrape_listings(listings: list[MatchListing], label: str) -> dict[str, int]:
-    """Shared driver: iterate a list of match links, fetch + parse + persist."""
-    stats = {"listed": len(listings), "ok": 0, "failed": 0, "player_rows": 0}
+def _filter_existing(listings: list[MatchListing]) -> tuple[list[MatchListing], int]:
+    """Drop listings whose match_id is already in the DB. Returns (kept, skipped)."""
+    if not listings:
+        return listings, 0
+    ids = [l.match_id for l in listings]
+    session = get_session()
+    try:
+        existing = set(
+            row[0]
+            for row in session.execute(select(Match.id).where(Match.id.in_(ids))).all()
+        )
+    finally:
+        session.close()
+    kept = [l for l in listings if l.match_id not in existing]
+    return kept, len(listings) - len(kept)
+
+
+def _scrape_listings(
+    listings: list[MatchListing], label: str, force: bool = False
+) -> dict[str, int]:
+    stats = {"listed": len(listings), "skipped": 0, "ok": 0, "failed": 0, "player_rows": 0}
+
+    if not force:
+        listings, n_skipped = _filter_existing(listings)
+        stats["skipped"] = n_skipped
+        if n_skipped:
+            log.info("Skipping %d match(es) already in DB (use --force to re-scrape)", n_skipped)
+
     log.info("Scraping %d matches for %s", len(listings), label)
 
     session = get_session()
@@ -235,12 +268,13 @@ def _scrape_listings(listings: list[MatchListing], label: str) -> dict[str, int]
                 n_rows = sum(len(m.player_stats) for m in detail.maps)
                 stats["player_rows"] += n_rows
                 log.info(
-                    "Saved %d: %s %s-%s %s  maps=%d  player_rows=%d",
+                    "Saved %d: %s %s-%s %s  event=%r  maps=%d  player_rows=%d",
                     detail.match_id,
                     detail.team_a_name,
                     detail.score_a if detail.score_a is not None else "?",
                     detail.score_b if detail.score_b is not None else "?",
                     detail.team_b_name,
+                    detail.event_name or "?",
                     len(detail.maps),
                     n_rows,
                 )
@@ -254,7 +288,7 @@ def _scrape_listings(listings: list[MatchListing], label: str) -> dict[str, int]
     return stats
 
 
-def scrape_recent(pages: int = 1) -> dict[str, int]:
+def scrape_recent(pages: int = 1, force: bool = False) -> dict[str, int]:
     listings: list[MatchListing] = []
     for p in range(1, pages + 1):
         try:
@@ -263,7 +297,6 @@ def scrape_recent(pages: int = 1) -> dict[str, int]:
             log.error("Failed to fetch results page %d: %s", p, exc)
             continue
         listings.extend(page_listings)
-    # De-duplicate by match_id (in case of overlap across pages)
     seen_ids: set[int] = set()
     unique: list[MatchListing] = []
     for l in listings:
@@ -271,22 +304,82 @@ def scrape_recent(pages: int = 1) -> dict[str, int]:
             continue
         seen_ids.add(l.match_id)
         unique.append(l)
-    return _scrape_listings(unique, f"recent ({pages} page(s))")
+    return _scrape_listings(unique, f"recent ({pages} page(s))", force=force)
 
 
-def scrape_event(event_id: int) -> dict[str, int]:
-    """Scrape every completed match in a specific event."""
+def scrape_event(event_id: int, force: bool = False) -> dict[str, int]:
     try:
         listings = fetch_event_matches(event_id)
     except HttpError as exc:
         log.error("Failed to fetch event %d matches: %s", event_id, exc)
-        return {"listed": 0, "ok": 0, "failed": 0, "player_rows": 0}
-    return _scrape_listings(listings, f"event {event_id}")
+        return {"listed": 0, "skipped": 0, "ok": 0, "failed": 0, "player_rows": 0}
+    return _scrape_listings(listings, f"event {event_id}", force=force)
 
 
-def scrape_match_ids(match_ids: Iterable[int]) -> dict[str, int]:
+def scrape_match_ids(match_ids: Iterable[int], force: bool = True) -> dict[str, int]:
+    """Explicit match IDs default to force=True since the user named them."""
     listings = [
         MatchListing(match_id=mid, url=f"{settings.vlr_base_url}/{mid}/_")
         for mid in match_ids
     ]
-    return _scrape_listings(listings, f"{len(listings)} explicit match id(s)")
+    return _scrape_listings(listings, f"{len(listings)} explicit match id(s)", force=force)
+
+
+# --- Maintenance ----------------------------------------------------------
+
+
+def repair_event_names() -> dict[str, int]:
+    """Fix events whose name is a status word by re-parsing one match per event.
+
+    Much faster than scrape-event because it only fetches the bare minimum.
+    """
+    stats = {"checked": 0, "fixed": 0, "no_match": 0, "failed": 0}
+    session = get_session()
+    try:
+        bad_events = (
+            session.execute(
+                select(Event).where(
+                    Event.name.in_(["upcoming", "completed", "live", "final", "tbd", ""])
+                )
+            )
+            .scalars()
+            .all()
+        )
+        stats["checked"] = len(bad_events)
+        if not bad_events:
+            return stats
+
+        log.info("Found %d event(s) with bad names, repairing...", len(bad_events))
+
+        for event in bad_events:
+            match = session.execute(
+                select(Match).where(Match.event_id == event.id).limit(1)
+            ).scalar_one_or_none()
+
+            if match is None:
+                log.warning("Event %d has no matches in DB — cannot repair", event.id)
+                stats["no_match"] += 1
+                continue
+
+            try:
+                detail = fetch_and_parse_match(match.url)
+            except Exception:
+                log.exception("Failed to re-fetch match %d for event %d", match.id, event.id)
+                stats["failed"] += 1
+                continue
+
+            if (
+                detail.event_name
+                and detail.event_name.strip().lower() not in _BAD_EVENT_NAMES
+            ):
+                old = event.name
+                event.name = detail.event_name.strip()
+                session.commit()
+                log.info("  event %d: '%s' → '%s'", event.id, old, event.name)
+                stats["fixed"] += 1
+            else:
+                log.warning("  event %d: re-parse still yielded no useful name", event.id)
+                stats["failed"] += 1
+    finally:
+        session.close()
+    return stats

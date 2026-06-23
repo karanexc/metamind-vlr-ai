@@ -3,7 +3,8 @@
 Usage examples:
     python -m vlr.cli init-db
     python -m vlr.cli scrape-recent --pages 1
-    python -m vlr.cli scrape-event 2765                 # all matches of one event
+    python -m vlr.cli scrape-event 2765                     # incremental by default
+    python -m vlr.cli scrape-event 2765 --force             # re-fetch everything
     python -m vlr.cli scrape-matches 670471 670470
     python -m vlr.cli discover-events --search masters
     python -m vlr.cli list-events
@@ -11,7 +12,9 @@ Usage examples:
     python -m vlr.cli show-match 670471
     python -m vlr.cli stats
     python -m vlr.cli top-players --metric rating --min-maps 5
-    python -m vlr.cli top-players --event 2765 --metric rating --min-maps 3
+    python -m vlr.cli top-players --event 2765 --metric rating
+    python -m vlr.cli audit                                 # data-quality report
+    python -m vlr.cli repair-events                         # fix bad event names
 """
 from __future__ import annotations
 
@@ -22,7 +25,7 @@ import typer
 from rich.console import Console
 from rich.logging import RichHandler
 from rich.table import Table
-from sqlalchemy import desc, func, select
+from sqlalchemy import desc, func, or_, select, text as sql_text
 
 from .db.models import (
     Event,
@@ -36,6 +39,7 @@ from .db.models import (
 from .db.session import get_session, init_db as _init_db
 from .scraping.pipeline import (
     discover_events,
+    repair_event_names,
     scrape_event,
     scrape_match_ids,
     scrape_recent,
@@ -55,12 +59,12 @@ def _configure_logging(verbose: bool) -> None:
     )
 
 
-# --- Setup / scraping commands -------------------------------------------
+# --- Setup / scraping ----------------------------------------------------
 
 
 @app.command("init-db")
 def init_db_cmd() -> None:
-    """Create all tables. Safe to run multiple times — adds new tables in place."""
+    """Create all tables. Safe to run multiple times."""
     _configure_logging(verbose=False)
     _init_db()
     console.print("[green]Schema created (or already present).[/green]")
@@ -69,28 +73,31 @@ def init_db_cmd() -> None:
 @app.command("scrape-recent")
 def scrape_recent_cmd(
     pages: int = typer.Option(1, "--pages", "-p"),
+    force: bool = typer.Option(False, "--force", help="Re-scrape matches already in DB"),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ) -> None:
-    """Scrape recent completed matches from vlr.gg/matches/results."""
+    """Scrape recent completed matches. Incremental by default."""
     _configure_logging(verbose)
-    stats = scrape_recent(pages=pages)
+    stats = scrape_recent(pages=pages, force=force)
     console.print(
-        f"\n[bold]Done.[/bold] listed={stats['listed']} ok={stats['ok']} "
-        f"failed={stats['failed']} player_rows={stats['player_rows']}"
+        f"\n[bold]Done.[/bold] listed={stats['listed']} skipped={stats['skipped']} "
+        f"ok={stats['ok']} failed={stats['failed']} player_rows={stats['player_rows']}"
     )
 
 
 @app.command("scrape-event")
 def scrape_event_cmd(
-    event_id: int = typer.Argument(..., help="vlr.gg event id (find with `discover-events`)"),
+    event_id: int = typer.Argument(...),
+    force: bool = typer.Option(False, "--force", help="Re-scrape matches already in DB"),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ) -> None:
-    """Scrape every match from a single vlr.gg event."""
+    """Scrape every match from one event. Incremental by default (skips matches
+    already in DB). Pass --force to re-fetch everything (useful after parser fixes)."""
     _configure_logging(verbose)
-    stats = scrape_event(event_id)
+    stats = scrape_event(event_id, force=force)
     console.print(
-        f"\n[bold]Done.[/bold] listed={stats['listed']} ok={stats['ok']} "
-        f"failed={stats['failed']} player_rows={stats['player_rows']}"
+        f"\n[bold]Done.[/bold] listed={stats['listed']} skipped={stats['skipped']} "
+        f"ok={stats['ok']} failed={stats['failed']} player_rows={stats['player_rows']}"
     )
 
 
@@ -99,7 +106,7 @@ def scrape_matches_cmd(
     match_ids: list[int] = typer.Argument(...),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ) -> None:
-    """Scrape specific match IDs."""
+    """Scrape specific match IDs (always re-fetches — you named them explicitly)."""
     _configure_logging(verbose)
     stats = scrape_match_ids(match_ids)
     console.print(
@@ -113,10 +120,10 @@ def scrape_matches_cmd(
 
 @app.command("discover-events")
 def discover_events_cmd(
-    search: Optional[str] = typer.Option(None, "--search", "-s", help="Case-insensitive substring filter"),
+    search: Optional[str] = typer.Option(None, "--search", "-s"),
     limit: int = typer.Option(25, "--limit", "-n"),
 ) -> None:
-    """Browse vlr.gg's events page to find event IDs (does NOT save to DB)."""
+    """Browse vlr.gg's events page to find event IDs."""
     _configure_logging(verbose=False)
     try:
         pairs = discover_events(search=search, limit=limit)
@@ -127,8 +134,7 @@ def discover_events_cmd(
     if not pairs:
         console.print(
             f"[yellow]No events found{f' for {search!r}' if search else ''}.[/yellow] "
-            f"vlr.gg's /events page only shows recent events — try a different search "
-            f"or browse https://www.vlr.gg/events manually."
+            f"Try a different search or browse https://www.vlr.gg/events manually."
         )
         return
 
@@ -138,10 +144,6 @@ def discover_events_cmd(
     for eid, name in pairs:
         t.add_row(str(eid), name[:80])
     console.print(t)
-    console.print(
-        "\n[dim]Use `python -m vlr.cli scrape-event <id>` to pull all matches "
-        "from one of these.[/dim]"
-    )
 
 
 @app.command("list-events")
@@ -165,12 +167,8 @@ def list_events_cmd() -> None:
             )
             .all()
         )
-
         if not rows:
-            console.print(
-                "[yellow]No events in the local DB yet.[/yellow] Try "
-                "`python -m vlr.cli scrape-recent --pages 1` first."
-            )
+            console.print("[yellow]No events in the local DB yet.[/yellow]")
             return
 
         t = Table(title="Events in local DB")
@@ -185,7 +183,162 @@ def list_events_cmd() -> None:
                     date_range = str(earliest.date())
                 else:
                     date_range = f"{earliest.date()} → {latest.date()}"
-            t.add_row(str(event_id), name[:60], str(n_matches), date_range)
+            t.add_row(str(event_id), (name or "")[:60], str(n_matches), date_range)
+        console.print(t)
+    finally:
+        session.close()
+
+
+# --- Maintenance ---------------------------------------------------------
+
+
+@app.command("repair-events")
+def repair_events_cmd(
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
+    """Fix events whose name is a status word ('upcoming', 'completed', etc.)
+    by re-parsing one match per event. Cheap — about 1 HTTP request per event."""
+    _configure_logging(verbose)
+    stats = repair_event_names()
+    if stats["checked"] == 0:
+        console.print("[green]No broken event names found.[/green]")
+        return
+    console.print(
+        f"\n[bold]Done.[/bold] checked={stats['checked']} fixed={stats['fixed']} "
+        f"no_match={stats['no_match']} failed={stats['failed']}"
+    )
+
+
+@app.command("audit")
+def audit_cmd() -> None:
+    """Run data-quality checks and print a report.
+
+    This is the kind of check your dissertation methodology chapter will need
+    to demonstrate — evidence that you understand your data before modelling it.
+    """
+    _configure_logging(verbose=False)
+    session = get_session()
+    try:
+        findings: list[tuple[str, int, str]] = []
+
+        # 1. Events with status-word names (parser artifacts)
+        bad_events = (
+            session.execute(
+                select(Event.id, Event.name).where(
+                    Event.name.in_(["upcoming", "completed", "live", "final", "tbd", ""])
+                )
+            )
+            .all()
+        )
+        if bad_events:
+            sample = ", ".join(f"{r[0]}={r[1]!r}" for r in bad_events[:3])
+            findings.append(
+                ("Events with status-word names — run `repair-events`",
+                 len(bad_events), sample)
+            )
+
+        # 2. Matches with no maps (forfeits or scraping failures)
+        n_no_maps = session.scalar(
+            select(func.count(Match.id)).where(
+                ~Match.id.in_(select(MapPlayed.match_id).distinct())
+            )
+        ) or 0
+        if n_no_maps:
+            findings.append(
+                ("Matches with no maps (forfeit / walkover / parse failure)",
+                 n_no_maps, "")
+            )
+
+        # 3. Matches missing scores
+        n_no_score = session.scalar(
+            select(func.count(Match.id)).where(
+                or_(Match.score_a.is_(None), Match.score_b.is_(None))
+            )
+        ) or 0
+        if n_no_score:
+            findings.append(("Matches with null score", n_no_score, ""))
+
+        # 4. Player-map rows with null rating
+        n_null_rating = session.scalar(
+            select(func.count(PlayerMapStat.id)).where(PlayerMapStat.rating.is_(None))
+        ) or 0
+        if n_null_rating:
+            findings.append(("Player-map rows with null rating", n_null_rating, ""))
+
+        # 5. Maps with player count != 10
+        wrong_count_maps = session.execute(
+            sql_text(
+                """
+                SELECT mp.match_id, mp.map_name, COUNT(pms.id) AS n_players
+                FROM maps_played mp
+                LEFT JOIN player_map_stats pms ON pms.map_id = mp.id
+                GROUP BY mp.id, mp.match_id, mp.map_name
+                HAVING COUNT(pms.id) NOT IN (0, 10)
+                ORDER BY n_players
+                LIMIT 5
+                """
+            )
+        ).all()
+        if wrong_count_maps:
+            sample = "; ".join(
+                f"match {r[0]} {r[1]}: {r[2]} rows"
+                for r in wrong_count_maps[:3]
+            )
+            findings.append(
+                ("Maps with player count != 10 (should be 5+5)",
+                 len(wrong_count_maps), sample)
+            )
+
+        # 6. Maps with no player stats at all (parser failure)
+        n_empty_maps = session.scalar(
+            sql_text(
+                """
+                SELECT COUNT(*) FROM maps_played mp
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM player_map_stats pms WHERE pms.map_id = mp.id
+                )
+                """
+            )
+        ) or 0
+        if n_empty_maps:
+            findings.append(("Maps with NO player stats (parser failed)", n_empty_maps, ""))
+
+        # 7. Matches with no event
+        n_no_event = session.scalar(
+            select(func.count(Match.id)).where(Match.event_id.is_(None))
+        ) or 0
+        if n_no_event:
+            findings.append(("Matches with no event_id", n_no_event, ""))
+
+        # 8. Matches with no team_a_id or team_b_id
+        n_no_team = session.scalar(
+            select(func.count(Match.id)).where(
+                or_(Match.team_a_id.is_(None), Match.team_b_id.is_(None))
+            )
+        ) or 0
+        if n_no_team:
+            findings.append(("Matches missing a team_id", n_no_team, ""))
+
+        # 9. Forfeit detection (one team has 0 maps wins, other has the BO count)
+        # Light-touch check: any match where score_a + score_b == 0
+        n_zero = session.scalar(
+            select(func.count(Match.id)).where(
+                Match.score_a == 0, Match.score_b == 0
+            )
+        ) or 0
+        if n_zero:
+            findings.append(("Matches with score 0-0 (likely walkover / TBD)", n_zero, ""))
+
+        if not findings:
+            console.print("[green]No data-quality issues detected.[/green]")
+            return
+
+        t = Table(title="Data-quality audit")
+        t.add_column("Issue", style="bold")
+        t.add_column("Count", justify="right")
+        t.add_column("Examples")
+        for label, count, sample in findings:
+            t.add_row(label, str(count), sample)
         console.print(t)
     finally:
         session.close()
@@ -246,19 +399,16 @@ def stats_cmd() -> None:
 @app.command("show-event")
 def show_event_cmd(
     event_id: int = typer.Argument(...),
-    min_maps: int = typer.Option(3, "--min-maps", help="Min maps for the leaderboard"),
-    top: int = typer.Option(10, "--top", help="How many top players to show"),
+    min_maps: int = typer.Option(3, "--min-maps"),
+    top: int = typer.Option(10, "--top"),
 ) -> None:
-    """Show all matches and a leaderboard for one event in the local DB."""
+    """Show all matches and a leaderboard for one event."""
     _configure_logging(verbose=False)
     session = get_session()
     try:
         event = session.get(Event, event_id)
         if event is None:
-            console.print(
-                f"[red]Event {event_id} not found in DB.[/red] "
-                f"Try `python -m vlr.cli scrape-event {event_id}` first."
-            )
+            console.print(f"[red]Event {event_id} not found in DB.[/red]")
             return
 
         console.print(f"\n[bold]{event.name}[/bold]   [dim]event_id={event_id}[/dim]")
@@ -272,9 +422,8 @@ def show_event_cmd(
             .scalars()
             .all()
         )
-
         if not matches:
-            console.print("[yellow]No matches in DB for this event yet.[/yellow]")
+            console.print("[yellow]No matches in DB for this event.[/yellow]")
             return
 
         t = Table(title=f"Matches ({len(matches)})")
@@ -295,7 +444,6 @@ def show_event_cmd(
             )
         console.print(t)
 
-        # Leaderboard within this event
         top_rows = (
             session.execute(
                 select(
@@ -314,9 +462,8 @@ def show_event_cmd(
             )
             .all()
         )
-
         if top_rows:
-            t = Table(title=f"Top {top} players by avg rating (min {min_maps} maps in event)")
+            t = Table(title=f"Top {top} players by avg rating (min {min_maps} maps)")
             t.add_column("Player")
             t.add_column("Maps", justify="right")
             t.add_column("Avg Rating", justify="right")
@@ -345,10 +492,7 @@ def show_match_cmd(match_id: int) -> None:
     try:
         m = session.get(Match, match_id)
         if m is None:
-            console.print(
-                f"[red]Match {match_id} not found in DB.[/red] "
-                f"Try `python -m vlr.cli scrape-matches {match_id}` first."
-            )
+            console.print(f"[red]Match {match_id} not found in DB.[/red]")
             return
 
         score_str = (
@@ -463,17 +607,11 @@ _METRIC_COLUMNS = {
 @app.command("top-players")
 def top_players_cmd(
     metric: str = typer.Option("rating", help=f"One of: {', '.join(_METRIC_COLUMNS)}"),
-    min_maps: int = typer.Option(5, "--min-maps", help="Minimum maps played"),
+    min_maps: int = typer.Option(5, "--min-maps"),
     limit: int = typer.Option(10),
-    event: Optional[int] = typer.Option(
-        None, "--event", "-e",
-        help="Filter to a specific event id (use list-events to see options)",
-    ),
+    event: Optional[int] = typer.Option(None, "--event", "-e"),
 ) -> None:
-    """Top players by average value of a metric across maps in the DB.
-
-    Pass --event to restrict to a single event (e.g. one VCT Masters).
-    """
+    """Top players by average metric. Optionally restrict to a single event."""
     _configure_logging(verbose=False)
     if metric not in _METRIC_COLUMNS:
         console.print(f"[red]Unknown metric: {metric}. Choose from {list(_METRIC_COLUMNS)}[/red]")
@@ -482,22 +620,21 @@ def top_players_cmd(
     col = _METRIC_COLUMNS[metric]
     session = get_session()
     try:
-        query = (
-            select(
-                PlayerMapStat.player_id,
-                func.count(PlayerMapStat.id).label("n_maps"),
-                func.avg(col).label("avg_metric"),
+        if event is None:
+            query = (
+                select(
+                    PlayerMapStat.player_id,
+                    func.count(PlayerMapStat.id).label("n_maps"),
+                    func.avg(col).label("avg_metric"),
+                )
+                .where(col.is_not(None))
+                .group_by(PlayerMapStat.player_id)
+                .having(func.count(PlayerMapStat.id) >= min_maps)
+                .order_by(desc("avg_metric"))
+                .limit(limit)
             )
-            .where(col.is_not(None))
-            .group_by(PlayerMapStat.player_id)
-            .having(func.count(PlayerMapStat.id) >= min_maps)
-            .order_by(desc("avg_metric"))
-            .limit(limit)
-        )
-
-        title = f"Top {limit} players by avg {metric} (min {min_maps} maps)"
-
-        if event is not None:
+            title = f"Top {limit} players by avg {metric} (min {min_maps} maps)"
+        else:
             query = (
                 select(
                     PlayerMapStat.player_id,
@@ -512,18 +649,14 @@ def top_players_cmd(
                 .limit(limit)
             )
             event_obj = session.get(Event, event)
-            if event_obj:
-                title = f"{event_obj.name} — top {limit} by avg {metric} (min {min_maps} maps)"
-            else:
-                title += f" — event {event}"
+            title = (
+                f"{event_obj.name if event_obj else f'event {event}'} — "
+                f"top {limit} by avg {metric} (min {min_maps} maps)"
+            )
 
         rows = session.execute(query).all()
-
         if not rows:
-            console.print(
-                f"[yellow]No results.[/yellow] "
-                f"{'Event has no scraped data yet — try `scrape-event " + str(event) + "`.' if event else 'Try lowering --min-maps.'}"
-            )
+            console.print("[yellow]No results. Try lowering --min-maps.[/yellow]")
             return
 
         t = Table(title=title)

@@ -1,12 +1,12 @@
 """HTML parsers for vlr.gg pages.
 
 Selectors here are based on the actual class names vlr.gg uses. The most
-important structural fact is that per-map stats live inside
+important structural facts:
 
-    div.vm-stats-container > div.vm-stats-game[data-game-id="<int>"]
-
-so we always scope to that container first to skip the small navigation
-tabs at the top of the match page.
+- Per-map stats live inside `div.vm-stats-container > div.vm-stats-game[data-game-id]`
+- The event name lives in `div.match-header-super` (NOT the status badge at the
+  top of the page, which is also a link to the event URL but contains the text
+  "upcoming"/"completed"/"live").
 
 If vlr.gg changes its HTML, this is the only file you should need to edit.
 """
@@ -28,6 +28,10 @@ MATCH_URL_RE = re.compile(r"^/(\d+)/[a-z0-9\-]+(?:/.*)?$", re.IGNORECASE)
 TEAM_URL_RE = re.compile(r"^/team/(\d+)/[a-z0-9\-]+/?$", re.IGNORECASE)
 EVENT_URL_RE = re.compile(r"^/event/(\d+)/[a-z0-9\-]+(?:/.*)?$", re.IGNORECASE)
 PLAYER_URL_RE = re.compile(r"^/player/(\d+)/[a-z0-9\-]+/?$", re.IGNORECASE)
+
+# Words that appear as the *text* of a link to an event URL but are status
+# badges, not the actual event name.
+_STATUS_WORDS = {"upcoming", "completed", "live", "final", "tbd", ""}
 
 
 # --- Dataclasses -----------------------------------------------------------
@@ -54,7 +58,7 @@ class PlayerStat:
     player_id: int
     player_name: str
     team_name: Optional[str] = None
-    team_index: Optional[int] = None  # 0 = first tbody (team A), 1 = second (team B)
+    team_index: Optional[int] = None
     agent: Optional[str] = None
     rating: Optional[float] = None
     acs: Optional[int] = None
@@ -118,7 +122,6 @@ def _strip(text: Optional[str]) -> Optional[str]:
 
 
 def _first_token(text: Optional[str]) -> Optional[str]:
-    """Return the first whitespace-separated token of the text, or None."""
     if text is None:
         return None
     cleaned = text.strip()
@@ -189,16 +192,50 @@ def parse_results_listing(html: str, base_url: str) -> list[MatchListing]:
 # --- Parser: match detail --------------------------------------------------
 
 
-def _extract_event_link(soup: BeautifulSoup) -> tuple[Optional[int], Optional[str]]:
+def _extract_event_info(soup: BeautifulSoup) -> tuple[Optional[int], Optional[str], Optional[str]]:
+    """Return (event_id, event_name, stage) from the match detail page.
+
+    The reliable place to get this is `div.match-header-super`, which contains
+    a single <a> linking to the event page. Inside the anchor is a container
+    <div> with two child divs: event name and stage label.
+
+    We avoid grabbing the *first* link to /event/<id>/ on the page because
+    that link wraps a status badge ("upcoming"/"completed"/"live") and its
+    text is the status word, not the event name.
+    """
+    super_header = soup.find("div", class_=re.compile(r"\bmatch-header-super\b"))
+    if super_header is not None:
+        a = super_header.find("a", href=EVENT_URL_RE)
+        if a is not None:
+            m = EVENT_URL_RE.match(a["href"])
+            event_id = int(m.group(1)) if m else None
+            container = a.find("div")
+            inner = container.find_all("div", recursive=False) if container else []
+            event_name = _strip(inner[0].get_text()) if len(inner) >= 1 else None
+            stage = _strip(inner[1].get_text()) if len(inner) >= 2 else None
+            if event_name and event_name.lower() not in _STATUS_WORDS:
+                return event_id, event_name, stage
+
+    # Fallback: scan all event-link anchors, skip status badges, prefer the
+    # longest non-status-word text.
+    candidates: list[tuple[int, str]] = []
     for a in soup.find_all("a", href=EVENT_URL_RE):
         m = EVENT_URL_RE.match(a["href"])
         if not m:
             continue
         text = _strip(a.get_text())
-        if not text:
+        if not text or text.lower() in _STATUS_WORDS:
             continue
-        return int(m.group(1)), text
-    return None, None
+        if len(text) < 5:
+            continue
+        candidates.append((int(m.group(1)), text))
+
+    if candidates:
+        # Pick the longest text — usually the actual descriptive event name
+        eid, name = max(candidates, key=lambda p: len(p[1]))
+        return eid, name, None
+
+    return None, None, None
 
 
 _PATCH_RE = re.compile(r"Patch\s+([0-9]+\.[0-9]+)", re.IGNORECASE)
@@ -208,14 +245,12 @@ _VETO_DECIDER_RE = re.compile(r"^(.+?)\s+(remains|decider)$", re.IGNORECASE)
 
 
 def _find_veto_text(soup: BeautifulSoup) -> Optional[str]:
-    # vlr.gg puts the veto string in a div with class "match-header-note"
     veto_node = soup.find("div", class_=re.compile(r"match-header-note"))
     if veto_node:
         text = _strip(veto_node.get_text())
         if text and ";" in text:
             return text
 
-    # Fallback: scan for any string containing the veto pattern
     for el in soup.find_all(string=True):
         s = _strip(str(el))
         if not s:
@@ -270,15 +305,12 @@ _MAP_POOL = {
 
 
 def _extract_team_tag(row: Tag, player_name: Optional[str]) -> Optional[str]:
-    """Pull the short team tag (e.g. 'PRX', 'LEV') from a player row."""
-    # Strategy 1: the small grey div under the player name
     team_node = row.find(class_=re.compile(r"ge-text-light|stats-sq"))
     if team_node:
         tag = _strip(team_node.get_text())
         if tag and tag != player_name:
             return tag
 
-    # Strategy 2: subtract player name from the full anchor text
     a = row.find("a", href=PLAYER_URL_RE)
     if a:
         full_text = _strip(a.get_text()) or ""
@@ -293,16 +325,11 @@ def _extract_team_tag(row: Tag, player_name: Optional[str]) -> Optional[str]:
 
 
 def _extract_agent(row: Tag) -> Optional[str]:
-    """The first <img> inside the row is the agent portrait on vlr.gg.
-
-    Falls back to filename parsing if alt/title are missing.
-    """
     cells = row.find_all("td")
-    # Agent is typically the second cell on the overview table
     candidate_cells = []
     if len(cells) >= 2:
         candidate_cells.append(cells[1])
-    candidate_cells.append(row)  # final fallback: any img in the row
+    candidate_cells.append(row)
 
     for cell in candidate_cells:
         img = cell.find("img")
@@ -322,20 +349,13 @@ def _extract_agent(row: Tag) -> Optional[str]:
 
 
 def _cell_value(cell: Tag) -> Optional[str]:
-    """Extract the 'both' (total) value from a stat cell.
-
-    Each cell on the overview table contains three spans: total / attack /
-    defense. The total is wrapped in `<span class="side mod-both">`.
-    """
     if cell is None:
         return None
-    # Preferred: explicit 'both' span
     both = cell.find("span", class_=re.compile(r"\bmod-both\b|\bside-both\b"))
     if both:
         text = _first_token(both.get_text())
         if text:
             return text
-    # Fallback: first numeric token of the cell text
     text = cell.get_text(" ", strip=True)
     for token in text.split():
         stripped = token.rstrip("%").lstrip("+-")
@@ -345,12 +365,6 @@ def _cell_value(cell: Tag) -> Optional[str]:
 
 
 def _parse_player_row(row: Tag, team_index: int) -> Optional[PlayerStat]:
-    """Parse one <tr> from a per-map stats <tbody>.
-
-    Overview column order on vlr.gg:
-        0 player | 1 agent | 2 R | 3 ACS | 4 K | 5 D | 6 A | 7 +/- |
-        8 KAST | 9 ADR | 10 HS% | 11 FK | 12 FD | 13 FK/FD diff
-    """
     a = row.find("a", href=PLAYER_URL_RE)
     if a is None:
         return None
@@ -393,15 +407,10 @@ def _parse_player_row(row: Tag, team_index: int) -> Optional[PlayerStat]:
 
 
 def _extract_player_stats(block: Tag) -> list[PlayerStat]:
-    """Find player rows in a single map block — two tbodies, 5 players each."""
     stats: list[PlayerStat] = []
     tbodies = block.find_all("tbody")
-    log.debug("  found %d tbody elements in this map block", len(tbodies))
-
     for team_index, tbody in enumerate(tbodies[:2]):
-        rows = tbody.find_all("tr")
-        log.debug("  tbody[%d] has %d rows", team_index, len(rows))
-        for row in rows:
+        for row in tbody.find_all("tr"):
             stat = _parse_player_row(row, team_index=team_index)
             if stat is not None:
                 stats.append(stat)
@@ -409,7 +418,6 @@ def _extract_player_stats(block: Tag) -> list[PlayerStat]:
 
 
 def _extract_map_score(score_div: Tag) -> Optional[int]:
-    """Each `div.score` on the map header contains the final-score integer."""
     if score_div is None:
         return None
     raw = score_div.get_text(" ", strip=True)
@@ -418,63 +426,42 @@ def _extract_map_score(score_div: Tag) -> Optional[int]:
 
 
 def _parse_maps(soup: BeautifulSoup) -> list[MapResult]:
-    """Extract per-map results from the vm-stats-container section.
-
-    The crucial scoping: blocks live inside <div class="vm-stats-container">.
-    Without this scoping, the small map navigation tabs at the top of the page
-    (which also use vm-stats-game-related markup) would be matched first and
-    swallow the real per-map blocks via the dedup check.
-    """
     results: list[MapResult] = []
     seen_names: set[str] = set()
 
     container = soup.find("div", class_=re.compile(r"\bvm-stats-container\b"))
     if container is None:
-        # Older or alternate markup: fall back to any vm-stats-game with content
         log.warning("No div.vm-stats-container found — falling back to global scan.")
         candidates = soup.find_all("div", class_=re.compile(r"\bvm-stats-game\b"))
         blocks = [b for b in candidates if b.find("tbody") is not None]
     else:
         blocks = container.find_all("div", class_=re.compile(r"\bvm-stats-game\b"))
-        log.debug("Found %d vm-stats-game blocks inside vm-stats-container", len(blocks))
 
     for block in blocks:
         game_id = block.get("data-game-id", "")
-        # Skip the 'all maps' aggregate
         if game_id == "all":
-            log.debug("  skipping aggregate (data-game-id=all)")
             continue
 
-        # Map name from div.map
         map_node = block.find("div", class_=re.compile(r"\bmap\b"))
         if map_node is None:
-            log.debug("  block has no div.map — skipping")
             continue
         map_text = _strip(map_node.get_text()) or ""
         map_name_raw = _first_token(map_text) or ""
         if not map_name_raw or map_name_raw.lower() == "tbd":
-            log.debug("  map name not yet determined (%r)", map_text)
             continue
-        # Normalize to canonical capitalised form if it's a known map
         if map_name_raw.lower() in _MAP_POOL:
             map_name = map_name_raw.lower().capitalize()
         else:
             map_name = map_name_raw
         if map_name in seen_names:
-            log.debug("  duplicate map %s — skipping", map_name)
             continue
         seen_names.add(map_name)
 
-        # Scores from two div.score elements (in document order)
         score_divs = block.find_all("div", class_=re.compile(r"\bscore\b"))
         score_a = _extract_map_score(score_divs[0]) if len(score_divs) >= 1 else None
         score_b = _extract_map_score(score_divs[1]) if len(score_divs) >= 2 else None
 
-        # Player stats from tbodies
         player_stats = _extract_player_stats(block)
-
-        log.info("  parsed map %s: %s-%s, %d player rows",
-                 map_name, score_a, score_b, len(player_stats))
 
         results.append(
             MapResult(
@@ -498,7 +485,7 @@ def parse_match_detail(html: str, match_url: str) -> MatchDetail:
         raise ValueError(f"Could not extract match id from URL: {match_url}")
     match_id = int(m.group(1))
 
-    # Teams from the match header. vlr.gg uses match-header-link with mod-1 / mod-2.
+    # Teams
     team_a_id = team_b_id = None
     team_a_name = team_b_name = ""
     header = soup.find("div", class_=re.compile(r"match-header-vs"))
@@ -515,14 +502,12 @@ def parse_match_detail(html: str, match_url: str) -> MatchDetail:
             if name_node is None:
                 name_node = link
             tname = _strip(name_node.get_text()) or ""
-            # Strip any trailing "[#1]"-style seed text or score numbers
             tname = re.split(r"\s+\[", tname)[0].strip()
             if side == "a":
                 team_a_id, team_a_name = tid, tname
             else:
                 team_b_id, team_b_name = tid, tname
 
-    # Fallback: first two unique /team/<id>/ links anywhere on the page
     if not team_a_name or not team_b_name:
         seen_ids: dict[int, str] = {}
         for a in soup.find_all("a", href=TEAM_URL_RE):
@@ -542,9 +527,10 @@ def parse_match_detail(html: str, match_url: str) -> MatchDetail:
             if team_b_id is None:
                 team_b_id, team_b_name = ordered[1]
 
-    event_id, event_name = _extract_event_link(soup)
+    # Event + stage (both now from match-header-super)
+    event_id, event_name, stage_from_event = _extract_event_info(soup)
 
-    # Overall match score (sets / map wins). vlr.gg wraps these in .js-spoiler.
+    # Match score
     score_a = score_b = None
     score_nodes = soup.select(".match-header-vs-score .js-spoiler span")
     score_ints = [_int_or_none(_strip(n.get_text())) for n in score_nodes]
@@ -556,10 +542,12 @@ def parse_match_detail(html: str, match_url: str) -> MatchDetail:
     best_of = int(_BO_RE.search(page_text).group(1)) if _BO_RE.search(page_text) else None
     patch = _PATCH_RE.search(page_text).group(1) if _PATCH_RE.search(page_text) else None
 
-    stage = None
-    stage_node = soup.find(class_=re.compile(r"match-header-event-series"))
-    if stage_node:
-        stage = _strip(stage_node.get_text())
+    # Stage: prefer the second div from event link, fall back to match-header-event-series
+    stage = stage_from_event
+    if not stage:
+        stage_node = soup.find(class_=re.compile(r"match-header-event-series"))
+        if stage_node:
+            stage = _strip(stage_node.get_text())
 
     match_datetime = None
     moment_node = soup.find(attrs={"data-utc-ts": True})
