@@ -1,0 +1,156 @@
+"""SQLAlchemy 2.x declarative models.
+
+Schema covers: teams, events, matches, maps_played, veto_actions,
+players, and player_map_stats. Per-round / economy data is still future work.
+"""
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Optional
+
+from sqlalchemy import (
+    BigInteger,
+    DateTime,
+    Float,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class Team(Base):
+    __tablename__ = "teams"
+
+    # vlr.gg's team id (from /team/<id>/...)
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    region: Mapped[Optional[str]] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
+
+
+class Event(Base):
+    __tablename__ = "events"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    name: Mapped[str] = mapped_column(String(512), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
+
+
+class Player(Base):
+    __tablename__ = "players"
+
+    # vlr.gg's player id (from /player/<id>/...)
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
+
+
+class Match(Base):
+    __tablename__ = "matches"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    event_id: Mapped[Optional[int]] = mapped_column(BigInteger, ForeignKey("events.id"))
+    team_a_id: Mapped[Optional[int]] = mapped_column(BigInteger, ForeignKey("teams.id"))
+    team_b_id: Mapped[Optional[int]] = mapped_column(BigInteger, ForeignKey("teams.id"))
+
+    team_a_name: Mapped[str] = mapped_column(String(255))
+    team_b_name: Mapped[str] = mapped_column(String(255))
+    score_a: Mapped[Optional[int]] = mapped_column(Integer)
+    score_b: Mapped[Optional[int]] = mapped_column(Integer)
+    best_of: Mapped[Optional[int]] = mapped_column(Integer)
+
+    stage: Mapped[Optional[str]] = mapped_column(String(255))
+    patch: Mapped[Optional[str]] = mapped_column(String(32))
+    match_datetime: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    veto_raw: Mapped[Optional[str]] = mapped_column(Text)
+
+    url: Mapped[str] = mapped_column(String(512), nullable=False)
+    scraped_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=datetime.utcnow
+    )
+
+    event = relationship("Event")
+    team_a = relationship("Team", foreign_keys=[team_a_id])
+    team_b = relationship("Team", foreign_keys=[team_b_id])
+    maps = relationship("MapPlayed", back_populates="match", cascade="all, delete-orphan")
+    veto_actions = relationship("VetoAction", back_populates="match", cascade="all, delete-orphan")
+    player_stats = relationship(
+        "PlayerMapStat", back_populates="match", cascade="all, delete-orphan"
+    )
+
+
+class MapPlayed(Base):
+    __tablename__ = "maps_played"
+    __table_args__ = (UniqueConstraint("match_id", "map_index", name="uq_map_per_match"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    match_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("matches.id"), nullable=False)
+    map_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    map_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    score_a: Mapped[Optional[int]] = mapped_column(Integer)
+    score_b: Mapped[Optional[int]] = mapped_column(Integer)
+    picked_by: Mapped[Optional[str]] = mapped_column(String(255))
+
+    match = relationship("Match", back_populates="maps")
+    player_stats = relationship(
+        "PlayerMapStat", back_populates="map_played", cascade="all, delete-orphan"
+    )
+
+
+class VetoAction(Base):
+    __tablename__ = "veto_actions"
+    __table_args__ = (
+        UniqueConstraint("match_id", "order_index", name="uq_veto_order_per_match"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    match_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("matches.id"), nullable=False)
+    order_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    team_name: Mapped[Optional[str]] = mapped_column(String(255))
+    action: Mapped[str] = mapped_column(String(32))
+    map_name: Mapped[str] = mapped_column(String(64))
+
+    match = relationship("Match", back_populates="veto_actions")
+
+
+class PlayerMapStat(Base):
+    """One row per (map, player). 10 rows per map (5 per team)."""
+
+    __tablename__ = "player_map_stats"
+    __table_args__ = (
+        UniqueConstraint("map_id", "player_id", name="uq_player_per_map"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    match_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("matches.id"), nullable=False)
+    map_id: Mapped[int] = mapped_column(Integer, ForeignKey("maps_played.id"), nullable=False)
+    player_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("players.id"), nullable=False)
+    team_id: Mapped[Optional[int]] = mapped_column(BigInteger, ForeignKey("teams.id"))
+    team_name: Mapped[Optional[str]] = mapped_column(String(255))
+
+    agent: Mapped[Optional[str]] = mapped_column(String(64))
+    rating: Mapped[Optional[float]] = mapped_column(Float)
+    acs: Mapped[Optional[int]] = mapped_column(Integer)
+    kills: Mapped[Optional[int]] = mapped_column(Integer)
+    deaths: Mapped[Optional[int]] = mapped_column(Integer)
+    assists: Mapped[Optional[int]] = mapped_column(Integer)
+    plus_minus: Mapped[Optional[int]] = mapped_column(Integer)
+    kast: Mapped[Optional[int]] = mapped_column(Integer)  # percentage 0-100
+    adr: Mapped[Optional[float]] = mapped_column(Float)
+    hs_pct: Mapped[Optional[int]] = mapped_column(Integer)  # percentage 0-100
+    fk: Mapped[Optional[int]] = mapped_column(Integer)
+    fd: Mapped[Optional[int]] = mapped_column(Integer)
+    fk_fd_diff: Mapped[Optional[int]] = mapped_column(Integer)
+
+    match = relationship("Match", back_populates="player_stats")
+    map_played = relationship("MapPlayed", back_populates="player_stats")
+    player = relationship("Player")
+    team = relationship("Team")

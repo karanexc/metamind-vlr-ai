@@ -1,0 +1,21 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: vlr-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: vlr
+      POSTGRES_PASSWORD: vlr_dev_password
+      POSTGRES_DB: vlr
+    ports:
+      - "5433:5432"  # 5433 on host so it doesn't clash with any local Postgres
+    volumes:
+      - vlr_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vlr -d vlr"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  vlr_pg_data:

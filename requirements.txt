@@ -1,0 +1,16 @@
+# Core
+sqlalchemy>=2.0.30,<3.0
+psycopg[binary]>=3.1.18,<4.0
+pydantic>=2.7,<3.0
+pydantic-settings>=2.2,<3.0
+python-dotenv>=1.0,<2.0
+
+# Scraping
+requests>=2.32,<3.0
+beautifulsoup4>=4.12,<5.0
+lxml>=5.2,<6.0
+tenacity>=8.2,<10.0
+
+# CLI
+typer>=0.12,<1.0
+rich>=13.7,<14.0
