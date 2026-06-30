@@ -18,6 +18,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -40,6 +41,9 @@ class Event(Base):
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     name: Mapped[str] = mapped_column(String(512), nullable=False)
+    # Tier classification: 'international', 'tier1', 'tier2', or NULL if unclassified.
+    # Populated by `vlr.ml.tiers.classify_event_tier()` based on the event name.
+    tier: Mapped[Optional[str]] = mapped_column(String(32))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
 
 
@@ -154,3 +158,48 @@ class PlayerMapStat(Base):
     map_played = relationship("MapPlayed", back_populates="player_stats")
     player = relationship("Player")
     team = relationship("Team")
+
+
+class MatchFeatureSnapshot(Base):
+    """Cached point-in-time feature vector for a match.
+
+    Populated by `vlr.ml.features.compute_and_cache_features()`. Used as input
+    to the XGBoost predictor.
+    """
+
+    __tablename__ = "match_feature_snapshots"
+
+    match_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("matches.id"), primary_key=True
+    )
+    features: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    computed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=datetime.utcnow, nullable=False
+    )
+
+    match = relationship("Match")
+
+
+class MatchAnalysisCache(Base):
+    """Cached LLM-generated analysis for a match.
+
+    The analysis is expensive (~$0.005 + 2-5 seconds per call). We cache it so
+    that opening the Match Analysis page for the same match is instant after
+    the first view. Click "regenerate" in the UI to force a fresh call.
+    """
+
+    __tablename__ = "match_analysis_cache"
+
+    match_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("matches.id"), primary_key=True
+    )
+    # Full structured analysis as JSON: summary, key_factors, standouts,
+    # underperformers, framing, model_used, prompt_version
+    analysis: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    model: Mapped[str] = mapped_column(String(64), nullable=False)
+    prompt_version: Mapped[str] = mapped_column(String(16), nullable=False)
+    generated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=datetime.utcnow, nullable=False
+    )
+
+    match = relationship("Match")

@@ -1,0 +1,13 @@
+# Event IDs from discover-events
+#   category=international  year=any  since=2024  region=any  search=None
+# Total: 9 events
+#
+2766  # Valorant Champions 2026 (2026, ?, international)
+2765  # Valorant Masters London 2026 (2026, ?, international)
+2760  # Valorant Masters Santiago 2026 (2026, ?, international)
+2283  # Valorant Champions 2025 (2025, ?, international)
+2282  # Valorant Masters Toronto 2025 (2025, ?, international)
+2281  # Valorant Masters Bangkok 2025 (2025, ?, international)
+2097  # Valorant Champions 2024 (2024, ?, international)
+1999  # Champions Tour 2024: Masters Shanghai (2024, ?, international)
+1921  # Champions Tour 2024: Masters Madrid (2024, ?, international)

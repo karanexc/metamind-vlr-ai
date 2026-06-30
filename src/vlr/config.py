@@ -17,5 +17,10 @@ class Settings(BaseSettings):
     )
     scrape_timeout_seconds: int = 20
 
+    # OpenAI — for the match analysis explanation layer (iteration 8)
+    openai_api_key: str = ""
+    openai_model: str = "gpt-4o"
+    openai_timeout_seconds: int = 30
+
 
 settings = Settings()

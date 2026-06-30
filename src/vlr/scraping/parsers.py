@@ -1,13 +1,5 @@
 """HTML parsers for vlr.gg pages.
 
-Selectors here are based on the actual class names vlr.gg uses. The most
-important structural facts:
-
-- Per-map stats live inside `div.vm-stats-container > div.vm-stats-game[data-game-id]`
-- The event name lives in `div.match-header-super` (NOT the status badge at the
-  top of the page, which is also a link to the event URL but contains the text
-  "upcoming"/"completed"/"live").
-
 If vlr.gg changes its HTML, this is the only file you should need to edit.
 """
 from __future__ import annotations
@@ -29,9 +21,7 @@ TEAM_URL_RE = re.compile(r"^/team/(\d+)/[a-z0-9\-]+/?$", re.IGNORECASE)
 EVENT_URL_RE = re.compile(r"^/event/(\d+)/[a-z0-9\-]+(?:/.*)?$", re.IGNORECASE)
 PLAYER_URL_RE = re.compile(r"^/player/(\d+)/[a-z0-9\-]+/?$", re.IGNORECASE)
 
-# Words that appear as the *text* of a link to an event URL but are status
-# badges, not the actual event name.
-_STATUS_WORDS = {"upcoming", "completed", "live", "final", "tbd", ""}
+_STATUS_WORDS = {"upcoming", "completed", "live", "final", "tbd", "ongoing", ""}
 
 
 # --- Dataclasses -----------------------------------------------------------
@@ -44,17 +34,30 @@ class MatchListing:
 
 
 @dataclass
+class EventListing:
+    """One event card from /events listings."""
+
+    event_id: int
+    name: str
+    url: str
+    category: Optional[str] = None     # 'international', 'regional', 'challengers', 'gc', 'other'
+    status: Optional[str] = None       # 'completed' / 'ongoing' / 'upcoming'
+    region: Optional[str] = None       # 'americas', 'emea', 'pacific', 'cn', 'global'
+    date_range: Optional[str] = None
+    year: Optional[int] = None
+    prize_pool: Optional[str] = None
+
+
+@dataclass
 class VetoAction:
     order_index: int
     team_name: Optional[str]
-    action: str  # 'ban' | 'pick' | 'decider'
+    action: str
     map_name: str
 
 
 @dataclass
 class PlayerStat:
-    """Per-map performance for one player."""
-
     player_id: int
     player_name: str
     team_name: Optional[str] = None
@@ -167,6 +170,78 @@ def _percent_or_none(text: Optional[str]) -> Optional[int]:
         return None
 
 
+_YEAR_RE = re.compile(r"\b(20[2-3]\d)\b")
+_DATE_RE = re.compile(r"[A-Z][a-z]{2,3}\s+\d{1,2}", re.IGNORECASE)
+_PRIZE_RE = re.compile(r"\$[\d,]+(?:\.\d+)?|^TBD$")
+
+
+def _infer_year(name: str, url: str, date_range: Optional[str]) -> Optional[int]:
+    for source in (name, url, date_range or ""):
+        m = _YEAR_RE.search(source)
+        if m:
+            return int(m.group(1))
+    return None
+
+
+# Region detection from event name (vlr.gg doesn't always have a flag image)
+_REGION_NAME_HINTS = [
+    # most specific first
+    (re.compile(r"\b(americas|amer|na\b|north\s+america|latam|brazil|brasil|braza|mexico|argentina|colombia)\b", re.I), "americas"),
+    (re.compile(r"\b(emea|europe\b|eu\b|mena|t[uü]rkiye|turkey|spain|france|dach|nordic|denmark|italy|uk|germany|poland|czech|portugal|africa)\b", re.I), "emea"),
+    (re.compile(r"\b(pacific|pac|sea\b|southeast\s+asia|japan|korea|jp\b|kr\b|south\s+asia|oce|oceania|wave|philippines|thailand|vietnam|indonesia|singapore)\b", re.I), "pacific"),
+    (re.compile(r"\b(china|chinese|cn\b)\b", re.I), "cn"),
+    (re.compile(r"\b(global|international|world|invitational)\b", re.I), "global"),
+]
+
+
+def _region_from_name(name: str) -> Optional[str]:
+    for pattern, mapped in _REGION_NAME_HINTS:
+        if pattern.search(name):
+            return mapped
+    return None
+
+
+# Name-based category classification — more reliable than vlr.gg's per-card markup
+_INTERNATIONAL_PATTERNS = [
+    re.compile(r"\bvalorant\s+masters\b", re.I),
+    re.compile(r"\bvalorant\s+champions\b", re.I),
+    re.compile(r"\bchampions\s+tour\b.*\bmasters\b", re.I),
+    re.compile(r"\bchampions\s+tour\b.*\bchampions\b", re.I),
+    re.compile(r"\bvct\s+kickoff\b", re.I),
+    re.compile(r"\bgame\s+changers\s+championship\b", re.I),
+    re.compile(r"\bvct.*stage\s+\d.*global", re.I),
+]
+_REGIONAL_PATTERNS = [
+    re.compile(r"\bvct\s+\d{4}:\s*(americas|emea|pacific|china)\b.*stage", re.I),
+    re.compile(r"\bchampions\s+tour\s+\d{4}:\s*(americas|emea|pacific|china)\s+stage", re.I),
+    re.compile(r"\bvct\s+\d{4}:\s*(americas|emea|pacific|china)", re.I),
+    re.compile(r"\bchampions\s+tour\s+\d{4}:\s*(americas|emea|pacific|china)", re.I),
+]
+_CHALLENGERS_PATTERNS = [
+    re.compile(r"\bchallengers\s+\d{4}\b", re.I),
+    re.compile(r"\bvcl\b", re.I),
+]
+_GC_PATTERNS = [
+    re.compile(r"\bgame\s+changers\b", re.I),
+]
+
+
+def _classify_event_name(name: str) -> str:
+    for pat in _INTERNATIONAL_PATTERNS:
+        if pat.search(name):
+            return "international"
+    for pat in _REGIONAL_PATTERNS:
+        if pat.search(name):
+            return "regional"
+    for pat in _CHALLENGERS_PATTERNS:
+        if pat.search(name):
+            return "challengers"
+    for pat in _GC_PATTERNS:
+        if pat.search(name):
+            return "gc"
+    return "other"
+
+
 # --- Parser: results listing ----------------------------------------------
 
 
@@ -189,20 +264,118 @@ def parse_results_listing(html: str, base_url: str) -> list[MatchListing]:
     return list(seen.values())
 
 
-# --- Parser: match detail --------------------------------------------------
+# --- Parser: events listing -----------------------------------------------
+
+
+def _extract_event_from_anchor(a: Tag, base_url: str) -> Optional[EventListing]:
+    """Each event 'card' on /events is itself an <a> tag.
+
+    The anchor's text content has a predictable structure:
+        Line 1: Event name
+        Line 2: status (ongoing/completed/upcoming)
+        Line 3: "Status" label
+        Line 4: prize pool value ($XXX or TBD)
+        Line 5: "Prize Pool" label
+        Line 6: dates (e.g. "Apr 2—May 17")
+        Line 7: "Dates" label
+        Line 8: "Region" label (the actual flag is an <img>)
+    """
+    m = EVENT_URL_RE.match(a.get("href", ""))
+    if not m:
+        return None
+    event_id = int(m.group(1))
+    href = a["href"].split("?", 1)[0]
+    url = _absolute(base_url, href)
+
+    text = a.get_text(separator="\n")
+    lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
+    if not lines:
+        return None
+
+    # First line is the event name
+    name = lines[0]
+    if len(name) < 3:
+        return None
+
+    # Status: a standalone line matching one of the status words
+    status = None
+    for line in lines[1:6]:
+        low = line.lower()
+        if low in ("ongoing", "completed", "upcoming", "live"):
+            status = low
+            break
+
+    # Prize pool: line that's a $ amount or "TBD" appearing before "Prize Pool" label
+    prize_pool = None
+    for i, line in enumerate(lines):
+        if _PRIZE_RE.match(line):
+            # Verify by checking the next line is the label (or just trust the match)
+            prize_pool = line
+            break
+
+    # Dates: line matching "Apr 2" or "Apr 2—May 17" patterns
+    date_range = None
+    for line in lines:
+        if _DATE_RE.search(line) and ("—" in line or "-" in line or line.count(" ") <= 3):
+            # Avoid picking up the event name if it contains a date-like substring
+            if line == name:
+                continue
+            date_range = line
+            break
+
+    # Region from the flag image if present (vlr.gg loads team-specific or
+    # region flag images near the end of the card)
+    region = None
+    for img in a.find_all("img"):
+        alt = (img.get("alt") or "").lower()
+        if alt in ("americas", "emea", "pacific", "china"):
+            region = alt
+            break
+    if not region:
+        region = _region_from_name(name)
+
+    category = _classify_event_name(name)
+    year = _infer_year(name, url, date_range)
+
+    return EventListing(
+        event_id=event_id,
+        name=name,
+        url=url,
+        category=category,
+        status=status,
+        region=region,
+        date_range=date_range,
+        year=year,
+        prize_pool=prize_pool,
+    )
+
+
+def parse_events_listing(html: str, base_url: str) -> list[EventListing]:
+    """Parse an /events page into a list of EventListings.
+
+    Each event 'card' on vlr.gg is a single <a> tag — we just iterate every
+    anchor that points to /event/<id>/<slug> and extract structured data
+    from its text content.
+    """
+    soup = BeautifulSoup(html, "lxml")
+    seen: dict[int, EventListing] = {}
+
+    for a in soup.find_all("a", href=EVENT_URL_RE):
+        listing = _extract_event_from_anchor(a, base_url)
+        if listing is None:
+            continue
+        if listing.event_id in seen:
+            continue
+        seen[listing.event_id] = listing
+
+    log.info("Found %d unique events on page", len(seen))
+    return list(seen.values())
+
+
+# --- Parser: match detail (unchanged) ------------------------------------
 
 
 def _extract_event_info(soup: BeautifulSoup) -> tuple[Optional[int], Optional[str], Optional[str]]:
-    """Return (event_id, event_name, stage) from the match detail page.
-
-    The reliable place to get this is `div.match-header-super`, which contains
-    a single <a> linking to the event page. Inside the anchor is a container
-    <div> with two child divs: event name and stage label.
-
-    We avoid grabbing the *first* link to /event/<id>/ on the page because
-    that link wraps a status badge ("upcoming"/"completed"/"live") and its
-    text is the status word, not the event name.
-    """
     super_header = soup.find("div", class_=re.compile(r"\bmatch-header-super\b"))
     if super_header is not None:
         a = super_header.find("a", href=EVENT_URL_RE)
@@ -216,8 +389,6 @@ def _extract_event_info(soup: BeautifulSoup) -> tuple[Optional[int], Optional[st
             if event_name and event_name.lower() not in _STATUS_WORDS:
                 return event_id, event_name, stage
 
-    # Fallback: scan all event-link anchors, skip status badges, prefer the
-    # longest non-status-word text.
     candidates: list[tuple[int, str]] = []
     for a in soup.find_all("a", href=EVENT_URL_RE):
         m = EVENT_URL_RE.match(a["href"])
@@ -231,7 +402,6 @@ def _extract_event_info(soup: BeautifulSoup) -> tuple[Optional[int], Optional[st
         candidates.append((int(m.group(1)), text))
 
     if candidates:
-        # Pick the longest text — usually the actual descriptive event name
         eid, name = max(candidates, key=lambda p: len(p[1]))
         return eid, name, None
 
@@ -301,16 +471,12 @@ _MAP_POOL = {
 }
 
 
-# --- Per-player stat extraction --------------------------------------------
-
-
 def _extract_team_tag(row: Tag, player_name: Optional[str]) -> Optional[str]:
     team_node = row.find(class_=re.compile(r"ge-text-light|stats-sq"))
     if team_node:
         tag = _strip(team_node.get_text())
         if tag and tag != player_name:
             return tag
-
     a = row.find("a", href=PLAYER_URL_RE)
     if a:
         full_text = _strip(a.get_text()) or ""
@@ -431,7 +597,6 @@ def _parse_maps(soup: BeautifulSoup) -> list[MapResult]:
 
     container = soup.find("div", class_=re.compile(r"\bvm-stats-container\b"))
     if container is None:
-        log.warning("No div.vm-stats-container found — falling back to global scan.")
         candidates = soup.find_all("div", class_=re.compile(r"\bvm-stats-game\b"))
         blocks = [b for b in candidates if b.find("tbody") is not None]
     else:
@@ -485,7 +650,6 @@ def parse_match_detail(html: str, match_url: str) -> MatchDetail:
         raise ValueError(f"Could not extract match id from URL: {match_url}")
     match_id = int(m.group(1))
 
-    # Teams
     team_a_id = team_b_id = None
     team_a_name = team_b_name = ""
     header = soup.find("div", class_=re.compile(r"match-header-vs"))
@@ -527,10 +691,8 @@ def parse_match_detail(html: str, match_url: str) -> MatchDetail:
             if team_b_id is None:
                 team_b_id, team_b_name = ordered[1]
 
-    # Event + stage (both now from match-header-super)
     event_id, event_name, stage_from_event = _extract_event_info(soup)
 
-    # Match score
     score_a = score_b = None
     score_nodes = soup.select(".match-header-vs-score .js-spoiler span")
     score_ints = [_int_or_none(_strip(n.get_text())) for n in score_nodes]
@@ -542,7 +704,6 @@ def parse_match_detail(html: str, match_url: str) -> MatchDetail:
     best_of = int(_BO_RE.search(page_text).group(1)) if _BO_RE.search(page_text) else None
     patch = _PATCH_RE.search(page_text).group(1) if _PATCH_RE.search(page_text) else None
 
-    # Stage: prefer the second div from event link, fall back to match-header-event-series
     stage = stage_from_event
     if not stage:
         stage_node = soup.find(class_=re.compile(r"match-header-event-series"))

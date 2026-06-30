@@ -1,10 +1,11 @@
 """Pipeline that ties together fetching, parsing, and persisting."""
 from __future__ import annotations
 
+import json
 import logging
+from pathlib import Path
 from typing import Iterable, Optional
 
-from bs4 import BeautifulSoup
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -21,19 +22,47 @@ from ..db.models import (
 from ..db.session import get_session
 from .client import HttpError, fetch
 from .parsers import (
-    EVENT_URL_RE,
+    EventListing,
     MatchDetail,
     MatchListing,
     PlayerStat,
+    parse_events_listing,
     parse_match_detail,
     parse_results_listing,
 )
 
 log = logging.getLogger(__name__)
 
-# Words that are status badges rather than real event names. Used to decide
-# whether to overwrite an existing Event.name in the DB.
-_BAD_EVENT_NAMES = {"upcoming", "completed", "live", "final", "tbd", ""}
+_BAD_EVENT_NAMES = {"upcoming", "completed", "live", "final", "tbd", "ongoing", ""}
+
+# vlr.gg's actual tier IDs (from /events page filter links)
+VLR_TIER_IDS = {
+    "vct": "60",            # VCT International + Regional Leagues
+    "vcl": "61",            # Challengers
+    "challengers": "61",
+    "t3": "62",
+    "gc": "63",
+    "game-changers": "63",
+    "collegiate": "64",
+    "offseason": "67",
+}
+
+# vlr.gg's region IDs
+VLR_REGION_IDS = {
+    "americas": "26", "amer": "26", "na": "26",
+    "emea": "27", "eu": "27",
+    "pacific": "28", "pac": "28", "ap": "28",
+    "cn": "24", "china": "24",
+}
+
+# Category → which vlr tier(s) to fetch, plus a client-side filter
+CATEGORY_VLR_TIERS = {
+    "international": "vct",
+    "regional": "vct",
+    "challengers": "vcl",
+    "gc": "gc",
+    "all-vct": "vct",
+}
 
 
 # --- Fetchers --------------------------------------------------------------
@@ -59,29 +88,127 @@ def fetch_and_parse_match(url: str) -> MatchDetail:
     return parse_match_detail(html, match_url=url)
 
 
-def discover_events(search: Optional[str] = None, limit: int = 25) -> list[tuple[int, str]]:
-    url = f"{settings.vlr_base_url}/events"
+def fetch_events_page(
+    page: int = 1,
+    vlr_tier: Optional[str] = None,
+    region: Optional[str] = None,
+) -> list[EventListing]:
+    """Fetch one page of the events listing using vlr.gg's URL filters.
+
+    vlr_tier: one of 'vct', 'vcl', 'gc', 't3' (uses vlr.gg's tier IDs).
+    region: 'americas', 'emea', 'pacific', 'cn' (uses vlr.gg's region IDs).
+    """
+    params: list[str] = []
+    if page > 1:
+        params.append(f"page={page}")
+    if vlr_tier:
+        tid = VLR_TIER_IDS.get(vlr_tier.lower())
+        if tid:
+            params.append(f"tier={tid}")
+        else:
+            log.warning("Unknown vlr_tier %r — ignoring", vlr_tier)
+    if region:
+        rid = VLR_REGION_IDS.get(region.lower())
+        if rid:
+            params.append(f"region={rid}")
+        else:
+            log.warning("Unknown region %r — ignoring", region)
+
+    base = f"{settings.vlr_base_url}/events"
+    if params:
+        url = f"{base}/?{'&'.join(params)}"
+    else:
+        url = base
+
+    log.debug("Fetching events page: %s", url)
     html = fetch(url)
-    soup = BeautifulSoup(html, "lxml")
+    return parse_events_listing(html, base_url=settings.vlr_base_url)
 
-    seen: dict[int, str] = {}
-    for a in soup.find_all("a", href=EVENT_URL_RE):
-        m = EVENT_URL_RE.match(a["href"])
-        if not m:
-            continue
-        eid = int(m.group(1))
-        if eid in seen:
-            continue
-        name = " ".join(a.get_text().split())
-        if not name or len(name) < 3 or name.lower() in _BAD_EVENT_NAMES:
-            continue
-        seen[eid] = name
 
-    pairs = list(seen.items())
-    if search:
-        needle = search.lower()
-        pairs = [(eid, name) for eid, name in pairs if needle in name.lower()]
-    return pairs[:limit]
+# --- Event discovery -------------------------------------------------------
+
+
+def discover_events(
+    search: Optional[str] = None,
+    category: Optional[str] = None,
+    year: Optional[int] = None,
+    since_year: Optional[int] = None,
+    region: Optional[str] = None,
+    status: Optional[str] = None,
+    max_pages: int = 8,
+    limit: Optional[int] = None,
+) -> list[EventListing]:
+    """Paginate through /events and return EventListings matching filters.
+
+    category: one of 'international', 'regional', 'challengers', 'gc', 'all-vct',
+              or None (no category filter — fetches all events).
+    """
+    results: list[EventListing] = []
+    seen_ids: set[int] = set()
+    needle = search.lower() if search else None
+    cat_norm = category.lower() if category else None
+    vlr_tier = CATEGORY_VLR_TIERS.get(cat_norm) if cat_norm else None
+
+    for page in range(1, max_pages + 1):
+        try:
+            listings = fetch_events_page(page=page, vlr_tier=vlr_tier, region=region)
+        except HttpError as exc:
+            log.warning("Failed to fetch events page %d: %s", page, exc)
+            break
+
+        if not listings:
+            log.info("Page %d returned no events — stopping", page)
+            break
+
+        page_min_year: Optional[int] = None
+        n_new = 0
+        n_kept = 0
+
+        for ev in listings:
+            if ev.event_id in seen_ids:
+                continue
+            seen_ids.add(ev.event_id)
+            n_new += 1
+
+            if ev.year is not None:
+                page_min_year = ev.year if page_min_year is None else min(page_min_year, ev.year)
+
+            # Apply client-side filters
+            if needle and needle not in ev.name.lower():
+                continue
+            if cat_norm:
+                # For 'international' and 'regional', we need to distinguish via name classification
+                if cat_norm in ("international", "regional", "challengers", "gc"):
+                    if (ev.category or "").lower() != cat_norm:
+                        continue
+                # else cat_norm is 'all-vct' — accept anything from the VCT tier
+            if year is not None and ev.year != year:
+                continue
+            if since_year is not None and (ev.year is None or ev.year < since_year):
+                continue
+            if status and (ev.status or "").lower() != status.lower():
+                continue
+
+            results.append(ev)
+            n_kept += 1
+
+            if limit is not None and len(results) >= limit:
+                log.info("Hit limit (%d) — stopping", limit)
+                return results
+
+        log.info("Page %d: %d new events, %d kept after filters", page, n_new, n_kept)
+
+        # Early-stop heuristic: if every event on this page is older than the
+        # year cutoff, further pages will be older still
+        if since_year is not None and page_min_year is not None and page_min_year < since_year:
+            log.info("Page min year %d < since_year %d — stopping", page_min_year, since_year)
+            break
+        if year is not None and page_min_year is not None and page_min_year < year - 1:
+            # Allow one page of slack in case events are ordered roughly by date
+            log.info("Page min year %d well below target %d — stopping", page_min_year, year)
+            break
+
+    return results
 
 
 # --- Persistence -----------------------------------------------------------
@@ -92,7 +219,6 @@ def _team_id_for_player(detail: MatchDetail, ps: PlayerStat) -> int | None:
         return detail.team_a_id
     if ps.team_index == 1:
         return detail.team_b_id
-
     if ps.team_name:
         tag = ps.team_name.strip().lower()
         a_name = (detail.team_a_name or "").lower()
@@ -105,26 +231,21 @@ def _team_id_for_player(detail: MatchDetail, ps: PlayerStat) -> int | None:
 
 
 def _upsert_event(session: Session, event_id: int, parsed_name: Optional[str]) -> None:
-    """Insert event if missing, update its name if the parsed one is better."""
     if event_id is None:
         return
     parsed_clean = (parsed_name or "").strip()
     if not parsed_clean or parsed_clean.lower() in _BAD_EVENT_NAMES:
-        return  # nothing useful to write
-
+        return
     event = session.get(Event, event_id)
     if event is None:
         session.add(Event(id=event_id, name=parsed_clean))
         return
-
     current = (event.name or "").strip().lower()
     if current in _BAD_EVENT_NAMES or event.name != parsed_clean:
-        # Either current is junk or differs from the new parse — overwrite
         event.name = parsed_clean
 
 
 def upsert_match(session: Session, detail: MatchDetail) -> Match:
-    # Teams
     for tid, tname in (
         (detail.team_a_id, detail.team_a_name),
         (detail.team_b_id, detail.team_b_name),
@@ -132,10 +253,8 @@ def upsert_match(session: Session, detail: MatchDetail) -> Match:
         if tid is not None and not session.get(Team, tid):
             session.add(Team(id=tid, name=tname or ""))
 
-    # Event (insert or update name)
     _upsert_event(session, detail.event_id, detail.event_name)
 
-    # Match
     match = session.get(Match, detail.match_id)
     if match is None:
         match = Match(id=detail.match_id, url=detail.url, team_a_name="", team_b_name="")
@@ -176,7 +295,6 @@ def upsert_match(session: Session, detail: MatchDetail) -> Match:
             if not session.get(Player, ps.player_id):
                 session.add(Player(id=ps.player_id, name=ps.player_name))
                 session.flush()
-
             session.add(
                 PlayerMapStat(
                     match_id=detail.match_id,
@@ -218,15 +336,13 @@ def upsert_match(session: Session, detail: MatchDetail) -> Match:
 
 
 def _filter_existing(listings: list[MatchListing]) -> tuple[list[MatchListing], int]:
-    """Drop listings whose match_id is already in the DB. Returns (kept, skipped)."""
     if not listings:
         return listings, 0
     ids = [l.match_id for l in listings]
     session = get_session()
     try:
         existing = set(
-            row[0]
-            for row in session.execute(select(Match.id).where(Match.id.in_(ids))).all()
+            row[0] for row in session.execute(select(Match.id).where(Match.id.in_(ids))).all()
         )
     finally:
         session.close()
@@ -243,7 +359,7 @@ def _scrape_listings(
         listings, n_skipped = _filter_existing(listings)
         stats["skipped"] = n_skipped
         if n_skipped:
-            log.info("Skipping %d match(es) already in DB (use --force to re-scrape)", n_skipped)
+            log.info("Skipping %d match(es) already in DB", n_skipped)
 
     log.info("Scraping %d matches for %s", len(listings), label)
 
@@ -284,7 +400,6 @@ def _scrape_listings(
                 stats["failed"] += 1
     finally:
         session.close()
-
     return stats
 
 
@@ -317,7 +432,6 @@ def scrape_event(event_id: int, force: bool = False) -> dict[str, int]:
 
 
 def scrape_match_ids(match_ids: Iterable[int], force: bool = True) -> dict[str, int]:
-    """Explicit match IDs default to force=True since the user named them."""
     listings = [
         MatchListing(match_id=mid, url=f"{settings.vlr_base_url}/{mid}/_")
         for mid in match_ids
@@ -325,21 +439,103 @@ def scrape_match_ids(match_ids: Iterable[int], force: bool = True) -> dict[str, 
     return _scrape_listings(listings, f"{len(listings)} explicit match id(s)", force=force)
 
 
+# --- Bulk event scraping with resumability -------------------------------
+
+
+def _read_event_id_file(filepath: Path) -> list[int]:
+    ids: list[int] = []
+    with filepath.open("r", encoding="utf-8") as f:
+        for raw in f:
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            token = line.split("#", 1)[0].strip().split()[0]
+            try:
+                ids.append(int(token))
+            except (ValueError, IndexError):
+                log.warning("Skipping unparseable line in events file: %r", raw)
+    return ids
+
+
+def bulk_scrape_events(
+    filepath: str | Path,
+    force: bool = False,
+    resume: bool = True,
+) -> dict[str, int]:
+    path = Path(filepath)
+    if not path.exists():
+        raise FileNotFoundError(f"Events file not found: {path}")
+
+    progress_path = path.with_suffix(path.suffix + ".progress")
+    progress: dict[str, dict] = {}
+    if resume and progress_path.exists():
+        try:
+            with progress_path.open("r", encoding="utf-8") as f:
+                progress = json.load(f)
+            log.info("Loaded progress from %s (%d entries)", progress_path, len(progress))
+        except (json.JSONDecodeError, OSError):
+            log.warning("Could not read progress file, starting fresh")
+            progress = {}
+
+    event_ids = _read_event_id_file(path)
+    log.info("Bulk-scraping %d events from %s", len(event_ids), path)
+
+    summary = {
+        "events_total": len(event_ids),
+        "events_skipped_done": 0,
+        "events_ok": 0,
+        "events_failed": 0,
+        "matches_ok": 0,
+        "matches_failed": 0,
+        "player_rows": 0,
+    }
+
+    for idx, event_id in enumerate(event_ids, start=1):
+        key = str(event_id)
+        prior = progress.get(key)
+        if resume and prior and prior.get("status") == "ok" and not force:
+            log.info("[%d/%d] Skipping event %d (already done)", idx, len(event_ids), event_id)
+            summary["events_skipped_done"] += 1
+            continue
+
+        log.info("[%d/%d] Scraping event %d ...", idx, len(event_ids), event_id)
+        try:
+            stats = scrape_event(event_id, force=force)
+            progress[key] = {
+                "status": "ok",
+                "matches_ok": stats["ok"],
+                "matches_failed": stats["failed"],
+                "player_rows": stats["player_rows"],
+            }
+            summary["events_ok"] += 1
+            summary["matches_ok"] += stats["ok"]
+            summary["matches_failed"] += stats["failed"]
+            summary["player_rows"] += stats["player_rows"]
+        except Exception as exc:
+            log.exception("Event %d failed entirely", event_id)
+            progress[key] = {"status": "failed", "error": str(exc)}
+            summary["events_failed"] += 1
+
+        try:
+            with progress_path.open("w", encoding="utf-8") as f:
+                json.dump(progress, f, indent=2)
+        except OSError:
+            log.warning("Could not write progress file")
+
+    return summary
+
+
 # --- Maintenance ----------------------------------------------------------
 
 
 def repair_event_names() -> dict[str, int]:
-    """Fix events whose name is a status word by re-parsing one match per event.
-
-    Much faster than scrape-event because it only fetches the bare minimum.
-    """
     stats = {"checked": 0, "fixed": 0, "no_match": 0, "failed": 0}
     session = get_session()
     try:
         bad_events = (
             session.execute(
                 select(Event).where(
-                    Event.name.in_(["upcoming", "completed", "live", "final", "tbd", ""])
+                    Event.name.in_(["upcoming", "completed", "live", "final", "tbd", "ongoing", ""])
                 )
             )
             .scalars()
@@ -355,19 +551,15 @@ def repair_event_names() -> dict[str, int]:
             match = session.execute(
                 select(Match).where(Match.event_id == event.id).limit(1)
             ).scalar_one_or_none()
-
             if match is None:
-                log.warning("Event %d has no matches in DB — cannot repair", event.id)
                 stats["no_match"] += 1
                 continue
-
             try:
                 detail = fetch_and_parse_match(match.url)
             except Exception:
                 log.exception("Failed to re-fetch match %d for event %d", match.id, event.id)
                 stats["failed"] += 1
                 continue
-
             if (
                 detail.event_name
                 and detail.event_name.strip().lower() not in _BAD_EVENT_NAMES
@@ -378,7 +570,6 @@ def repair_event_names() -> dict[str, int]:
                 log.info("  event %d: '%s' → '%s'", event.id, old, event.name)
                 stats["fixed"] += 1
             else:
-                log.warning("  event %d: re-parse still yielded no useful name", event.id)
                 stats["failed"] += 1
     finally:
         session.close()
