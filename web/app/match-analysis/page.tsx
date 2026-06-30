@@ -8,16 +8,29 @@ import { Select } from '@/components/ui/select';
 import { Button } from '@/components/ui/button';
 import { formatDate, cn } from '@/lib/utils';
 
+const TIER_OPTIONS = [
+  { value: 'all', label: 'All tiers', sub: 'Recent matches across all events' },
+  { value: 'international', label: 'International (VCT)', sub: 'Masters, Champions, Kickoff' },
+  { value: 'tier1', label: 'Tier 1 Regional', sub: 'VCT regional leagues' },
+  { value: 'tier2', label: 'Tier 2 / Challengers', sub: 'VCL, regional challengers' },
+];
+
 export default function MatchAnalysisPage() {
+  const [tier, setTier] = useState<string>('all');
   const [matches, setMatches] = useState<MatchListItem[]>([]);
   const [matchId, setMatchId] = useState<number | null>(null);
   const [match, setMatch] = useState<MatchDetail | null>(null);
   const [analysis, setAnalysis] = useState<LossAnalysis | null>(null);
   const [loading, setLoading] = useState(false);
 
+  // Load matches when tier changes
   useEffect(() => {
-    api.recentMatches(100).then(setMatches).catch(console.error);
-  }, []);
+    setMatches([]);
+    setMatchId(null);
+    setMatch(null);
+    setAnalysis(null);
+    api.matchesByTier(tier, 100).then(setMatches).catch(console.error);
+  }, [tier]);
 
   useEffect(() => {
     if (matchId === null) return;
@@ -39,9 +52,9 @@ export default function MatchAnalysisPage() {
     }
   }
 
-  // Auto-load analysis on match select
   useEffect(() => {
     if (matchId !== null) loadAnalysis(false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [matchId]);
 
   const matchOptions = matches.map((m) => ({
@@ -64,8 +77,9 @@ export default function MatchAnalysisPage() {
           AI-generated match breakdown
         </h1>
         <p className="mt-4 text-base text-ink-soft max-w-2xl leading-relaxed">
-          Pick a completed match. The XGBoost model identifies the most influential features
-          via SHAP attribution. GPT-4o verbalizes them into a coaching-ready breakdown.
+          Pick a tier, then a match. The XGBoost model identifies the most influential
+          features via SHAP attribution. GPT-4o verbalizes them into a coaching-ready
+          breakdown.
         </p>
       </motion.div>
 
@@ -73,14 +87,26 @@ export default function MatchAnalysisPage() {
         initial={{ opacity: 0, y: 20 }}
         animate={{ opacity: 1, y: 0 }}
         transition={{ delay: 0.1 }}
-        className="mt-10 bg-surface border border-border rounded-2xl p-6"
+        className="mt-10 bg-surface border border-border rounded-2xl p-6 space-y-4"
       >
+        <Select
+          label="Tier"
+          options={TIER_OPTIONS}
+          value={tier}
+          onChange={(v) => setTier(String(v))}
+          searchable={false}
+        />
         <Select
           label="Match"
           options={matchOptions}
           value={matchId}
           onChange={(v) => setMatchId(Number(v))}
-          placeholder="Pick a match to analyze..."
+          placeholder={
+            matches.length === 0
+              ? 'Loading matches...'
+              : `Pick from ${matches.length} matches...`
+          }
+          disabled={matches.length === 0}
         />
       </motion.div>
 
@@ -174,14 +200,12 @@ export default function MatchAnalysisPage() {
                   animate={{ opacity: 1, y: 0 }}
                   className="space-y-4"
                 >
-                  {/* Summary */}
                   <div className="bg-surface border border-border border-l-2 border-l-accent rounded-2xl p-6">
                     <div className="text-base text-ink leading-relaxed">
                       {analysis.summary}
                     </div>
                   </div>
 
-                  {/* Key factors + Standouts/Underperformers */}
                   <div className="grid md:grid-cols-2 gap-4">
                     <div>
                       <h3 className="text-[0.7rem] font-medium uppercase tracking-widest text-ink-dim mb-3">

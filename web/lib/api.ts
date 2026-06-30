@@ -171,6 +171,36 @@ export interface TopPlayer {
   avg_metric: number;
 }
 
+export interface RegionalTeam {
+  id: number;
+  name: string;
+  logo_url: string | null;
+  country: string | null;
+  matches_played: number;
+  wins: number;
+  losses: number;
+  win_pct: number;
+}
+
+export interface TeamRosterPlayer {
+  id: number;
+  name: string;
+  image_url: string | null;
+  country: string | null;
+  real_name: string | null;
+  last_played: string | null;
+}
+
+export interface LeaderboardTeam extends RegionalTeam {
+  region: string | null;
+  roster: {
+    id: number;
+    name: string;
+    image_url: string | null;
+    country: string | null;
+  }[];
+}
+
 // --- API methods --------------------------------------------------------
 
 export const api = {
@@ -190,8 +220,21 @@ export const api = {
 
   recentMatches: (limit = 20) =>
     request<MatchListItem[]>(`/api/v1/matches/recent?limit=${limit}`),
+  matchesByTier: (tier: string, limit = 60) =>
+    request<MatchListItem[]>(`/api/v1/matches/by-tier/${tier}?limit=${limit}`),
   match: (id: number) => request<MatchDetail>(`/api/v1/matches/${id}`),
   events: () => request<{ id: number; name: string }[]>('/api/v1/events'),
+
+  regionalTopTeams: (region: string, limit = 5) =>
+    request<RegionalTeam[]>(
+      `/api/v1/regions/${region}/top-teams?limit=${limit}`,
+    ),
+  teamRoster: (teamId: number) =>
+    request<TeamRosterPlayer[]>(`/api/v1/teams/${teamId}/roster`),
+  teamsLeaderboard: (region: string, limit = 50) =>
+    request<LeaderboardTeam[]>(
+      `/api/v1/regions/${region}/teams-leaderboard?limit=${limit}`,
+    ),
 
   predict: (teamAId: number, teamBId: number, bestOf: number) =>
     request<MatchPrediction>('/api/v1/predict', {

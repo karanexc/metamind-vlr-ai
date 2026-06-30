@@ -422,6 +422,21 @@ def scrape_recent(pages: int = 1, force: bool = False) -> dict[str, int]:
     return _scrape_listings(unique, f"recent ({pages} page(s))", force=force)
 
 
+def scrape_recent_results(pages: int = 1) -> int:
+    """Background-friendly wrapper. Returns count of new matches inserted.
+
+    Skips matches already in the DB (via _filter_existing inside _scrape_listings).
+    Errors are caught and logged — never raised — so the caller (a scheduler
+    or web request) won't crash.
+    """
+    try:
+        result = scrape_recent(pages=pages, force=False)
+        return result.get("inserted", 0) + result.get("updated", 0)
+    except Exception:
+        log.exception("scrape_recent_results failed")
+        return 0
+
+
 def scrape_event(event_id: int, force: bool = False) -> dict[str, int]:
     try:
         listings = fetch_event_matches(event_id)
@@ -574,3 +589,202 @@ def repair_event_names() -> dict[str, int]:
     finally:
         session.close()
     return stats
+
+
+# --- Player profile backfill (Iteration 9 Drop 2) ---------------------------
+
+
+def fetch_player_profile(player_id: int):
+    """Fetch and parse a single player profile page from vlr.gg.
+
+    Returns a PlayerProfile dataclass, or None if the page couldn't be fetched.
+    Profile fields can still be None individually if vlr.gg's HTML didn't match
+    our selectors — caller should handle that gracefully.
+    """
+    from .parsers import parse_player_profile, PlayerProfile
+    # vlr.gg redirects /player/{id} to /player/{id}/{slug} automatically.
+    # Trailing slug doesn't matter — vlr.gg matches by ID.
+    url = f"https://www.vlr.gg/player/{player_id}/_"
+    try:
+        html = fetch(url)
+    except HttpError as exc:
+        log.error("Failed to fetch player %d: %s", player_id, exc)
+        return None
+    return parse_player_profile(html, player_id)
+
+
+def fetch_team_profile(team_id: int):
+    """Fetch and parse a team profile page. Returns TeamProfile or None."""
+    from .parsers import parse_team_profile
+    url = f"https://www.vlr.gg/team/{team_id}/_"
+    try:
+        html = fetch(url)
+    except HttpError as exc:
+        log.error("Failed to fetch team %d: %s", team_id, exc)
+        return None
+    return parse_team_profile(html, team_id)
+
+
+def save_player_profile(profile, force: bool = False) -> bool:
+    """Persist a PlayerProfile. Returns True if the row was updated.
+
+    By default skips rows that already have an image_url to support resumable
+    backfills. Pass force=True to overwrite.
+    """
+    session = get_session()
+    try:
+        player = session.get(Player, profile.player_id)
+        if player is None:
+            return False
+        if player.image_url and not force:
+            # Already populated — leave it alone.
+            return False
+        # Only set fields we successfully parsed; never overwrite with None.
+        updated = False
+        if profile.image_url:
+            player.image_url = profile.image_url
+            updated = True
+        if profile.country:
+            player.country = profile.country
+            updated = True
+        if profile.real_name:
+            player.real_name = profile.real_name
+            updated = True
+        if updated:
+            session.commit()
+        return updated
+    finally:
+        session.close()
+
+
+def save_team_profile(profile, force: bool = False) -> bool:
+    """Persist a TeamProfile. Skips already-populated rows by default."""
+    session = get_session()
+    try:
+        team = session.get(Team, profile.team_id)
+        if team is None:
+            return False
+        if team.logo_url and not force:
+            return False
+        updated = False
+        if profile.logo_url:
+            team.logo_url = profile.logo_url
+            updated = True
+        if profile.country:
+            team.country = profile.country
+            updated = True
+        if updated:
+            session.commit()
+        return updated
+    finally:
+        session.close()
+
+
+def backfill_player_profiles(
+    limit: Optional[int] = None,
+    force: bool = False,
+    on_progress=None,
+) -> dict[str, int]:
+    """Iterate every player and scrape their vlr.gg profile.
+
+    Skips players who already have an image_url (resumable across crashes).
+    Pass force=True to re-scrape everyone.
+
+    `on_progress` is called as `on_progress(index, total, player_id, status)`
+    after each player so the CLI can render a live progress bar.
+    """
+    session = get_session()
+    try:
+        # Order by id so progress is predictable across runs.
+        query = session.execute(
+            select(Player.id, Player.image_url).order_by(Player.id.asc())
+        )
+        rows = [(pid, img) for pid, img in query.all()]
+    finally:
+        session.close()
+
+    todo = rows if force else [(pid, img) for pid, img in rows if not img]
+    if limit:
+        todo = todo[:limit]
+
+    counts = {"attempted": 0, "updated": 0, "failed": 0, "no_data": 0,
+              "skipped": len(rows) - len(todo)}
+    total = len(todo)
+
+    for i, (pid, _) in enumerate(todo, start=1):
+        counts["attempted"] += 1
+        try:
+            profile = fetch_player_profile(pid)
+            if profile is None:
+                counts["failed"] += 1
+                status = "failed"
+            elif profile.image_url is None and profile.country is None:
+                counts["no_data"] += 1
+                status = "no_data"
+            else:
+                if save_player_profile(profile, force=force):
+                    counts["updated"] += 1
+                    status = "ok"
+                else:
+                    counts["no_data"] += 1
+                    status = "no_data"
+        except Exception:
+            log.exception("Unexpected error scraping player %d", pid)
+            counts["failed"] += 1
+            status = "failed"
+
+        if on_progress:
+            on_progress(i, total, pid, status)
+
+    return counts
+
+
+def backfill_team_logos(
+    limit: Optional[int] = None,
+    force: bool = False,
+    on_progress=None,
+) -> dict[str, int]:
+    """Same as backfill_player_profiles but for team logos."""
+    session = get_session()
+    try:
+        query = session.execute(
+            select(Team.id, Team.logo_url).order_by(Team.id.asc())
+        )
+        rows = [(tid, logo) for tid, logo in query.all()]
+    finally:
+        session.close()
+
+    todo = rows if force else [(tid, logo) for tid, logo in rows if not logo]
+    if limit:
+        todo = todo[:limit]
+
+    counts = {"attempted": 0, "updated": 0, "failed": 0, "no_data": 0,
+              "skipped": len(rows) - len(todo)}
+    total = len(todo)
+
+    for i, (tid, _) in enumerate(todo, start=1):
+        counts["attempted"] += 1
+        try:
+            profile = fetch_team_profile(tid)
+            if profile is None:
+                counts["failed"] += 1
+                status = "failed"
+            elif profile.logo_url is None:
+                counts["no_data"] += 1
+                status = "no_data"
+            else:
+                if save_team_profile(profile, force=force):
+                    counts["updated"] += 1
+                    status = "ok"
+                else:
+                    counts["no_data"] += 1
+                    status = "no_data"
+        except Exception:
+            log.exception("Unexpected error scraping team %d", tid)
+            counts["failed"] += 1
+            status = "failed"
+
+        if on_progress:
+            on_progress(i, total, tid, status)
+
+    return counts

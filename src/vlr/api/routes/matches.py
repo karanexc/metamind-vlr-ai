@@ -26,6 +26,55 @@ async def recent_matches(limit: int = Query(20, ge=1, le=200)) -> list[MatchList
     ]
 
 
+@router.get("/matches/by-tier/{tier}", response_model=list[MatchListItem])
+async def matches_by_tier(
+    tier: str,
+    limit: int = Query(60, ge=1, le=200),
+) -> list[MatchListItem]:
+    """Recent matches filtered by event tier.
+
+    Valid tier values: international | tier1 | tier2 | all
+    """
+    if tier not in {"international", "tier1", "tier2", "all"}:
+        raise HTTPException(
+            status_code=400,
+            detail="tier must be 'international', 'tier1', 'tier2', or 'all'",
+        )
+
+    from vlr.db.session import get_session
+    from sqlalchemy import text as sql_text
+    session = get_session()
+    try:
+        tier_filter = "" if tier == "all" else "AND e.tier = :tier"
+        params = {"limit": limit}
+        if tier != "all":
+            params["tier"] = tier
+        rows = session.execute(sql_text(f"""
+            SELECT m.id, m.team_a_name, m.team_b_name, m.score_a, m.score_b,
+                   m.best_of, m.stage, m.match_datetime, e.name AS event_name
+            FROM matches m
+            LEFT JOIN events e ON e.id = m.event_id
+            WHERE m.score_a IS NOT NULL AND m.score_b IS NOT NULL
+              AND (m.score_a > 0 OR m.score_b > 0)
+              {tier_filter}
+            ORDER BY m.match_datetime DESC NULLS LAST
+            LIMIT :limit
+        """), params).all()
+
+        return [
+            MatchListItem(
+                match_id=r[0],
+                team_a=r[1], team_b=r[2],
+                score_a=r[3] or 0, score_b=r[4] or 0,
+                best_of=r[5], stage=r[6],
+                datetime=r[7], event=r[8],
+            )
+            for r in rows
+        ]
+    finally:
+        session.close()
+
+
 @router.get("/matches/{match_id}", response_model=MatchDetail)
 async def get_match(match_id: int) -> MatchDetail:
     detail = data.get_match_detail(match_id)

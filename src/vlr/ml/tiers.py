@@ -82,3 +82,45 @@ TIER_NUMERIC = {
 
 def tier_to_numeric(tier: Optional[str]) -> Optional[int]:
     return TIER_NUMERIC.get(tier) if tier else None
+
+
+# --- Region classification -----------------------------------------------
+# Each event belongs to a region. We use this to tag teams with their
+# primary region (the one their event history most overlaps with).
+
+_REGION_PATTERNS = [
+    (re.compile(r"\b(americas|north america|brazil|latam|nrt|na |emea)?\b.*americas", re.I), "americas"),
+    (re.compile(r"\bamericas\b", re.I), "americas"),
+    (re.compile(r"\b(brazil|latam|north america|na\b)", re.I), "americas"),
+
+    (re.compile(r"\bemea\b", re.I), "emea"),
+    (re.compile(r"\b(europe|mena|middle east|africa|turkey)\b", re.I), "emea"),
+
+    (re.compile(r"\bpacific\b", re.I), "pacific"),
+    (re.compile(r"\b(korea|japan|sea|south east asia|oceania|south asia)\b", re.I), "pacific"),
+
+    (re.compile(r"\bchina\b", re.I), "china"),
+]
+
+
+def classify_event_region(name: Optional[str]) -> Optional[str]:
+    """Return 'americas', 'emea', 'pacific', 'china', or None for international/unknown."""
+    if not name:
+        return None
+    # International events (Masters, Champions, Kickoff) don't have a region
+    if re.search(r"\b(masters|champions|kickoff)\b", name, re.I) and not re.search(
+        r"\b(americas|emea|pacific|china)\b", name, re.I
+    ):
+        return None
+    for pattern, region in _REGION_PATTERNS:
+        if pattern.search(name):
+            return region
+    return None
+
+
+REGION_DISPLAY = {
+    "americas": "Americas",
+    "emea": "EMEA",
+    "pacific": "Pacific",
+    "china": "China",
+}

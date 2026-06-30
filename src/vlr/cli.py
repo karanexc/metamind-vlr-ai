@@ -612,6 +612,189 @@ def backfill_tiers_cmd(verbose: bool = typer.Option(False, "--verbose", "-v")) -
         session.close()
 
 
+@app.command("backfill-regions")
+def backfill_regions_cmd(verbose: bool = typer.Option(False, "--verbose", "-v")) -> None:
+    """Classify every team by region using their match history.
+
+    For each team: looks at the regional events they've appeared in
+    (excluding international events like Masters/Champions/Kickoff)
+    and picks the region they appear in most often.
+
+    Run this once after upgrading. Re-run any time after big scrapes
+    to keep regions current.
+    """
+    _configure_logging(verbose)
+    from .ml.tiers import classify_event_region
+    from collections import Counter
+
+    session = get_session()
+    try:
+        # Ensure the column exists (idempotent)
+        session.execute(sql_text(
+            "ALTER TABLE teams ADD COLUMN IF NOT EXISTS region VARCHAR(64)"
+        ))
+        session.commit()
+
+        # For each team, count how many matches they played in each region
+        rows = session.execute(sql_text("""
+            SELECT m.team_a_id AS team_id, e.name AS event_name
+            FROM matches m
+            JOIN events e ON e.id = m.event_id
+            WHERE m.team_a_id IS NOT NULL
+
+            UNION ALL
+
+            SELECT m.team_b_id AS team_id, e.name AS event_name
+            FROM matches m
+            JOIN events e ON e.id = m.event_id
+            WHERE m.team_b_id IS NOT NULL
+        """)).all()
+
+        per_team: dict[int, Counter] = {}
+        for team_id, event_name in rows:
+            region = classify_event_region(event_name)
+            if region is None:
+                continue
+            per_team.setdefault(team_id, Counter())[region] += 1
+
+        # Pick the most common region per team
+        counts = {"americas": 0, "emea": 0, "pacific": 0, "china": 0, "unclassified": 0}
+        for team_id, region_counts in per_team.items():
+            top_region, _ = region_counts.most_common(1)[0]
+            session.execute(sql_text(
+                "UPDATE teams SET region = :r WHERE id = :tid"
+            ), {"r": top_region, "tid": team_id})
+            counts[top_region] += 1
+
+        # Count teams with no regional events
+        total_teams = session.scalar(select(func.count()).select_from(Team)) or 0
+        counts["unclassified"] = total_teams - sum(
+            v for k, v in counts.items() if k != "unclassified"
+        )
+
+        session.commit()
+
+        t = Table(title="Team region classification results")
+        t.add_column("Region", style="bold")
+        t.add_column("Teams", justify="right")
+        for k, v in counts.items():
+            t.add_row(k, str(v))
+        console.print(t)
+    finally:
+        session.close()
+
+
+@app.command("scrape-recent-results")
+def scrape_recent_results_cmd(
+    pages: int = typer.Option(1, "--pages", "-p"),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
+    """Scrape vlr.gg /matches/results for the most recent completed matches.
+
+    Wraps the same logic the live results scheduler uses. Run it manually
+    once to verify it works before letting the API auto-scrape.
+    """
+    _configure_logging(verbose)
+    from .scraping.pipeline import scrape_recent_results
+    n_new = scrape_recent_results(pages=pages)
+    console.print(f"[green]Done.[/green] {n_new} new matches added to the database.")
+
+
+@app.command("backfill-player-profiles")
+def backfill_player_profiles_cmd(
+    limit: Optional[int] = typer.Option(None, "--limit", "-n",
+        help="Only scrape this many players (for testing). Omit to scrape all."),
+    force: bool = typer.Option(False, "--force",
+        help="Re-scrape players that already have an image_url"),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
+    """Scrape vlr.gg for every player's photo, country flag, and real name.
+
+    Resumable: by default skips players who already have an image_url, so
+    if this crashes halfway you can just re-run and it picks up where it left off.
+
+    With 7,000+ players and a 2-second delay per request, expect this to take
+    around 4 hours end to end. Run it in a screen/tmux session or overnight.
+    Use --limit 20 first to verify the scraper actually works on real pages.
+    """
+    _configure_logging(verbose)
+    from .scraping.pipeline import backfill_player_profiles
+    from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, \
+        TimeRemainingColumn, MofNCompleteColumn
+
+    counts_seen = {"ok": 0, "no_data": 0, "failed": 0}
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[bold blue]Scraping players"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TimeRemainingColumn(),
+        TextColumn("· last: pid={task.fields[last_pid]} [{task.fields[last_status]}]"),
+        console=console,
+    ) as progress:
+        task = progress.add_task("scrape", total=None, last_pid="-", last_status="-")
+
+        def cb(i, total, pid, status):
+            if progress.tasks[task].total is None:
+                progress.update(task, total=total)
+            counts_seen[status] = counts_seen.get(status, 0) + 1
+            progress.update(task, advance=1, last_pid=str(pid), last_status=status)
+
+        stats = backfill_player_profiles(limit=limit, force=force, on_progress=cb)
+
+    t = Table(title="Player profile backfill")
+    t.add_column("Metric", style="bold")
+    t.add_column("Count", justify="right")
+    for k, v in stats.items():
+        t.add_row(k, str(v))
+    console.print(t)
+
+
+@app.command("backfill-team-logos")
+def backfill_team_logos_cmd(
+    limit: Optional[int] = typer.Option(None, "--limit", "-n"),
+    force: bool = typer.Option(False, "--force"),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
+    """Scrape vlr.gg for every team's logo URL and country.
+
+    1,500-ish teams at 2-second delay ~= 50 minutes. Faster than player profiles.
+    """
+    _configure_logging(verbose)
+    from .scraping.pipeline import backfill_team_logos
+    from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, \
+        TimeRemainingColumn, MofNCompleteColumn
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[bold blue]Scraping teams"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TimeRemainingColumn(),
+        TextColumn("· last: tid={task.fields[last_tid]} [{task.fields[last_status]}]"),
+        console=console,
+    ) as progress:
+        task = progress.add_task("scrape", total=None, last_tid="-", last_status="-")
+
+        def cb(i, total, tid, status):
+            if progress.tasks[task].total is None:
+                progress.update(task, total=total)
+            progress.update(task, advance=1, last_tid=str(tid), last_status=status)
+
+        stats = backfill_team_logos(limit=limit, force=force, on_progress=cb)
+
+    t = Table(title="Team logo backfill")
+    t.add_column("Metric", style="bold")
+    t.add_column("Count", justify="right")
+    for k, v in stats.items():
+        t.add_row(k, str(v))
+    console.print(t)
+
+
+# --- compute-features stays below ---------------------------------------
+
+
 @app.command("compute-features")
 def compute_features_cmd(
     force: bool = typer.Option(False, "--force", help="Recompute features that already exist"),

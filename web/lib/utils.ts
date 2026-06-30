@@ -25,3 +25,35 @@ export function formatDate(iso: string | null | undefined, format: 'short' | 'lo
 export function formatNumber(n: number): string {
   return new Intl.NumberFormat('en-US').format(n);
 }
+
+/**
+ * Convert an ISO-2 country code (e.g. 'us', 'kr') into a Unicode flag emoji.
+ * Returns null if the code is missing or malformed — caller can fall back to
+ * showing nothing.
+ */
+export function countryFlag(code: string | null | undefined): string | null {
+  if (!code || code.length !== 2 || !/^[a-z]{2}$/i.test(code)) return null;
+  // Flag emojis are formed by mapping each ASCII letter to its
+  // Regional Indicator Symbol (U+1F1E6 = 🇦 for 'A')
+  const upper = code.toUpperCase();
+  const codepoints = [...upper].map(c => 0x1F1A5 + c.charCodeAt(0));
+  return String.fromCodePoint(...codepoints);
+}
+
+/**
+ * Stable color from a string — used as a fallback when a player photo is
+ * missing. Same input always produces the same color so the UI feels stable.
+ */
+export function avatarColor(name: string): string {
+  const colors = [
+    '#7C3AED', '#0EA5E9', '#10B981', '#F59E0B',
+    '#EC4899', '#EF4444', '#6366F1', '#14B8A6',
+  ];
+  if (!name) return colors[0];
+  return colors[name.charCodeAt(0) % colors.length];
+}
+
+export function initials(name: string): string {
+  if (!name) return '?';
+  return name.slice(0, 2).toUpperCase();
+}

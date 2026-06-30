@@ -5,7 +5,7 @@ these — we keep them stable so the JS doesn't break when we tweak internals.
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime as DateTime
 from typing import Optional
 
 from pydantic import BaseModel
@@ -22,8 +22,8 @@ class DatabaseStats(BaseModel):
     players: int
     maps: int
     player_rows: int
-    earliest_match: Optional[datetime] = None
-    latest_match: Optional[datetime] = None
+    earliest_match: Optional[DateTime] = None
+    latest_match: Optional[DateTime] = None
 
 
 # --- Teams ---------------------------------------------------------------
@@ -85,7 +85,7 @@ class MatchListItem(BaseModel):
     score_b: int
     best_of: Optional[int] = None
     stage: Optional[str] = None
-    datetime: Optional[datetime] = None
+    datetime: Optional[DateTime] = None
     event: Optional[str] = None
 
 
@@ -123,7 +123,7 @@ class MatchDetail(BaseModel):
     best_of: Optional[int] = None
     stage: Optional[str] = None
     patch: Optional[str] = None
-    datetime: Optional[datetime] = None
+    datetime: Optional[DateTime] = None
     event_name: Optional[str] = None
     event_id: Optional[int] = None
     maps: list[MapDetail]

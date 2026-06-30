@@ -749,3 +749,159 @@ def parse_match_detail(html: str, match_url: str) -> MatchDetail:
         veto_actions=veto_actions,
         maps=maps,
     )
+
+
+# --- Player profile parser (Iteration 9 Drop 2) -----------------------------
+# Extracts photo URL, country, and real name from a vlr.gg /player/{id}/ page.
+# Defensive: tries multiple selectors, returns None for any field it can't find.
+
+
+@dataclass
+class PlayerProfile:
+    player_id: int
+    name: Optional[str] = None
+    real_name: Optional[str] = None
+    image_url: Optional[str] = None
+    country: Optional[str] = None       # ISO-2 code, lowercase ('us', 'kr', 'br', etc.)
+    country_name: Optional[str] = None  # human-readable, for display fallback
+
+
+def parse_player_profile(html: str, player_id: int) -> PlayerProfile:
+    """Parse a vlr.gg player page.
+
+    vlr.gg's player page layout (best-effort selector targeting):
+    - Header div contains an avatar image and the player's handle
+    - A flag <i> tag with class like 'mod-{country_code}' near the name
+    - Real name in a sibling element to the handle
+
+    If vlr.gg changes the markup, this function still returns a PlayerProfile;
+    it just leaves the unrecognised fields as None.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    profile = PlayerProfile(player_id=player_id)
+
+    # --- Image -------------------------------------------------------------
+    # Common patterns on vlr.gg player headers
+    img: Optional[Tag] = None
+    for selector in [
+        ".player-header img",
+        ".wf-avatar img",
+        "img.player-header-img",
+        ".mod-player img",
+    ]:
+        img = soup.select_one(selector)
+        if img and img.get("src"):
+            break
+
+    if img:
+        src = img.get("src", "").strip()
+        if src and not src.endswith("ph/sil.png"):  # vlr.gg silhouette = no photo
+            # vlr.gg sometimes uses protocol-relative or path-only URLs
+            if src.startswith("//"):
+                src = "https:" + src
+            elif src.startswith("/"):
+                src = "https://www.vlr.gg" + src
+            profile.image_url = src
+
+    # --- Country flag ------------------------------------------------------
+    # Flag icons on vlr.gg have a class like 'flag mod-us'
+    flag = None
+    for selector in [
+        ".player-header .flag",
+        ".ge-text-light .flag",
+        ".flag.mod-",
+    ]:
+        flag = soup.select_one(selector)
+        if flag:
+            break
+
+    if flag:
+        classes = flag.get("class") or []
+        for c in classes:
+            if c.startswith("mod-") and len(c) > 4:
+                code = c.replace("mod-", "").strip().lower()
+                # Only accept ISO-2 codes
+                if len(code) == 2 and code.isalpha():
+                    profile.country = code
+                    break
+        # Also capture the country name if present (usually next to the flag)
+        # vlr.gg renders country name as sibling text
+        parent = flag.parent
+        if parent:
+            text = parent.get_text(" ", strip=True)
+            if text and len(text) < 60:
+                profile.country_name = text
+
+    # --- Handle (player name) ---------------------------------------------
+    handle_el = soup.select_one(".player-header .wf-title") or soup.select_one("h1.wf-title")
+    if handle_el:
+        profile.name = handle_el.get_text(strip=True) or None
+
+    # --- Real name --------------------------------------------------------
+    real_el = soup.select_one(".player-header .player-real-name") or \
+              soup.select_one(".wf-title-med")
+    if real_el:
+        text = real_el.get_text(strip=True)
+        if text and text != profile.name:
+            profile.real_name = text
+
+    return profile
+
+
+# --- Team logo parser ------------------------------------------------------
+
+
+@dataclass
+class TeamProfile:
+    team_id: int
+    name: Optional[str] = None
+    logo_url: Optional[str] = None
+    country: Optional[str] = None
+
+
+def parse_team_profile(html: str, team_id: int) -> TeamProfile:
+    """Parse a vlr.gg team page for the team logo and country.
+
+    vlr.gg team page structure (best-effort):
+    - Logo image in the header
+    - Country flag near the team name
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    profile = TeamProfile(team_id=team_id)
+
+    # --- Logo --------------------------------------------------------------
+    logo = None
+    for selector in [
+        ".team-header-logo img",
+        ".wf-avatar.team img",
+        ".team-header img",
+    ]:
+        logo = soup.select_one(selector)
+        if logo and logo.get("src"):
+            break
+
+    if logo:
+        src = logo.get("src", "").strip()
+        if src and "ph/sil" not in src:
+            if src.startswith("//"):
+                src = "https:" + src
+            elif src.startswith("/"):
+                src = "https://www.vlr.gg" + src
+            profile.logo_url = src
+
+    # --- Country flag ------------------------------------------------------
+    flag = soup.select_one(".team-header-country .flag") or \
+           soup.select_one(".team-header .flag")
+    if flag:
+        for c in flag.get("class") or []:
+            if c.startswith("mod-") and len(c) == 6:
+                profile.country = c.replace("mod-", "").lower()
+                break
+
+    # --- Team name ---------------------------------------------------------
+    name_el = soup.select_one(".team-header-name .wf-title") or \
+              soup.select_one("h1.wf-title")
+    if name_el:
+        profile.name = name_el.get_text(strip=True) or None
+
+    return profile

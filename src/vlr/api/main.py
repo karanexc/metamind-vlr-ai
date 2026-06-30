@@ -18,6 +18,7 @@ from slowapi.errors import RateLimitExceeded
 
 from .limits import limiter
 from .routes import explain, matches, players, predict, stats, teams
+from .scheduler import start_scheduler, stop_scheduler
 
 log = logging.getLogger(__name__)
 
@@ -32,6 +33,17 @@ app = FastAPI(
     ),
     version="1.0.0",
 )
+
+
+@app.on_event("startup")
+async def _startup():
+    start_scheduler()
+
+
+@app.on_event("shutdown")
+async def _shutdown():
+    stop_scheduler()
+
 
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)

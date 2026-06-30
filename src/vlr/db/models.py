@@ -33,6 +33,8 @@ class Team(Base):
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     region: Mapped[Optional[str]] = mapped_column(String(64))
+    logo_url: Mapped[Optional[str]] = mapped_column(String(512))
+    country: Mapped[Optional[str]] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
 
 
@@ -53,6 +55,9 @@ class Player(Base):
     # vlr.gg's player id (from /player/<id>/...)
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
+    image_url: Mapped[Optional[str]] = mapped_column(String(512))
+    country: Mapped[Optional[str]] = mapped_column(String(64))
+    real_name: Mapped[Optional[str]] = mapped_column(String(255))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
 
 

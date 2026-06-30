@@ -25,6 +25,20 @@ _MIGRATIONS: list[tuple[str, str]] = [
     # Iteration 7b — events.tier
     ("add_events_tier",
      "ALTER TABLE events ADD COLUMN IF NOT EXISTS tier VARCHAR(32)"),
+    # Iteration 9 Drop 1 — teams.region
+    ("add_teams_region",
+     "ALTER TABLE teams ADD COLUMN IF NOT EXISTS region VARCHAR(64)"),
+    # Iteration 9 Drop 2 — player photos + flags + team logos
+    ("add_players_image_url",
+     "ALTER TABLE players ADD COLUMN IF NOT EXISTS image_url VARCHAR(512)"),
+    ("add_players_country",
+     "ALTER TABLE players ADD COLUMN IF NOT EXISTS country VARCHAR(64)"),
+    ("add_players_real_name",
+     "ALTER TABLE players ADD COLUMN IF NOT EXISTS real_name VARCHAR(255)"),
+    ("add_teams_logo_url",
+     "ALTER TABLE teams ADD COLUMN IF NOT EXISTS logo_url VARCHAR(512)"),
+    ("add_teams_country",
+     "ALTER TABLE teams ADD COLUMN IF NOT EXISTS country VARCHAR(64)"),
 ]
 
 
