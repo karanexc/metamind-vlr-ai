@@ -115,6 +115,28 @@ def get_event_options() -> list[tuple[int, str]]:
         session.close()
 
 
+@st.cache_data(ttl=600)
+def get_event_teams(event_id: int) -> list[tuple[int, str]]:
+    """Distinct teams that appear in an event's matches (played or scheduled).
+
+    Returns (team_id, name). Used to auto-populate the Pick'em team list for a
+    tournament. Includes both real and scheduled matches so participants show
+    up even before they've played.
+    """
+    session = get_session()
+    try:
+        rows = session.execute(sql_text("""
+            SELECT DISTINCT t.id, t.name
+            FROM matches m
+            JOIN teams t ON (t.id = m.team_a_id OR t.id = m.team_b_id)
+            WHERE m.event_id = :eid
+            ORDER BY t.name ASC
+        """), {"eid": event_id}).all()
+        return [(r[0], r[1]) for r in rows]
+    finally:
+        session.close()
+
+
 # --- Team listings -------------------------------------------------------
 
 

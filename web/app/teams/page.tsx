@@ -5,6 +5,7 @@ import { motion } from 'framer-motion';
 import { ChevronRight, Search } from 'lucide-react';
 import { api, type LeaderboardTeam } from '@/lib/api';
 import { PlayerAvatar, TeamLogo } from '@/components/ui/avatar';
+import { Skeleton } from '@/components/ui/skeleton';
 import { cn, countryFlag } from '@/lib/utils';
 
 type RegionFilter = 'all' | 'americas' | 'emea' | 'pacific' | 'china';
@@ -122,16 +123,29 @@ export default function TeamsPage() {
           <div />
         </div>
 
-        {/* Empty/loading */}
+        {/* Skeleton rows while loading */}
         {loading && (
-          <div className="px-6 py-16 text-center text-sm text-ink-dim">
-            <div className="inline-flex items-center gap-2">
-              <span className="relative flex w-2 h-2">
-                <span className="absolute inline-flex w-full h-full rounded-full bg-accent opacity-75 animate-ping" />
-                <span className="relative inline-flex w-2 h-2 rounded-full bg-accent" />
-              </span>
-              Loading leaderboard...
-            </div>
+          <div>
+            {Array.from({ length: 8 }).map((_, i) => (
+              <div
+                key={i}
+                className="grid grid-cols-[60px_1fr] md:grid-cols-[60px_1fr_120px_140px_minmax(280px,1fr)_40px] gap-4 px-6 py-4 border-b border-border last:border-0 items-center"
+              >
+                <Skeleton className="w-7 h-7 rounded-full" />
+                <div className="flex items-center gap-3">
+                  <Skeleton className="w-10 h-10 rounded-md" />
+                  <Skeleton className="h-4 w-32 rounded" />
+                </div>
+                <Skeleton className="hidden md:block h-4 w-16 rounded" />
+                <Skeleton className="hidden md:block h-4 w-20 rounded" />
+                <div className="hidden md:flex items-center gap-2">
+                  {Array.from({ length: 5 }).map((_, j) => (
+                    <Skeleton key={j} className="w-8 h-8 rounded-full" />
+                  ))}
+                </div>
+                <div className="hidden md:block" />
+              </div>
+            ))}
           </div>
         )}
 

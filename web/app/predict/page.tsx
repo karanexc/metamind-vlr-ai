@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { AlertTriangle, Loader2 } from 'lucide-react';
+import { AlertTriangle, Loader2, Swords } from 'lucide-react';
 import { api, type TeamListItem, type MatchPrediction } from '@/lib/api';
 import { Select } from '@/components/ui/select';
 import { Button } from '@/components/ui/button';
@@ -315,12 +315,57 @@ export default function PredictPage() {
         {!prediction && !loading && (
           <motion.div
             key="empty"
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
+            initial={{ opacity: 0, y: 10 }}
+            animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0 }}
-            className="mt-16 text-center text-sm text-ink-dim"
+            className="mt-12"
           >
-            Pick two teams and a format above to generate a prediction.
+            <div className="relative bg-gradient-card border border-border rounded-3xl p-10 overflow-hidden">
+              <div className="absolute inset-0 grid-bg opacity-30 pointer-events-none" />
+              <div className="relative flex items-center justify-center gap-6 md:gap-12">
+                {[
+                  { id: teamAId, fallback: 'Team A' },
+                  { id: teamBId, fallback: 'Team B' },
+                ].map((slot, i) => {
+                  const name = teams.find((t) => t.id === slot.id)?.name;
+                  return (
+                    <div key={i} className="contents">
+                      {i === 1 && (
+                        <motion.div
+                          className="w-12 h-12 rounded-full border border-border bg-surface flex items-center justify-center flex-shrink-0"
+                          animate={{ scale: [1, 1.08, 1] }}
+                          transition={{ duration: 2.4, repeat: Infinity, ease: 'easeInOut' }}
+                        >
+                          <span className="font-mono text-xs tracking-widest text-ink-soft">VS</span>
+                        </motion.div>
+                      )}
+                      <div className="flex-1 flex flex-col items-center gap-3 min-w-0">
+                        <motion.div
+                          className={cn(
+                            'w-16 h-16 rounded-2xl border flex items-center justify-center',
+                            name ? 'border-accent/40 bg-accent/5' : 'border-dashed border-border',
+                          )}
+                          animate={name ? undefined : { opacity: [0.5, 1, 0.5] }}
+                          transition={{ duration: 2.2, repeat: Infinity, delay: i * 0.4 }}
+                        >
+                          <Swords className={cn('w-6 h-6', name ? 'text-accent' : 'text-ink-dim')} />
+                        </motion.div>
+                        <div className={cn(
+                          'text-sm font-semibold text-center truncate max-w-full',
+                          name ? 'text-ink' : 'text-ink-dim',
+                        )}>
+                          {name || slot.fallback}
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+              <div className="relative mt-8 text-center text-sm text-ink-dim">
+                Pick two teams and a format above — the model returns win probabilities,
+                a projected scoreline, and a per-map breakdown.
+              </div>
+            </div>
           </motion.div>
         )}
       </AnimatePresence>

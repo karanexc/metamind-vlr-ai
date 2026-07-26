@@ -17,7 +17,7 @@ from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 
 from .limits import limiter
-from .routes import explain, matches, players, predict, stats, teams
+from .routes import explain, live, matches, pickem, players, predict, stats, teams
 from .scheduler import start_scheduler, stop_scheduler
 
 log = logging.getLogger(__name__)
@@ -109,6 +109,8 @@ app.include_router(players.router, prefix=API_PREFIX, tags=["players"])
 app.include_router(matches.router, prefix=API_PREFIX, tags=["matches"])
 app.include_router(predict.router, prefix=API_PREFIX, tags=["predict"])
 app.include_router(explain.router, prefix=API_PREFIX, tags=["explain"])
+app.include_router(pickem.router, prefix=API_PREFIX, tags=["pickem"])
+app.include_router(live.router, prefix=API_PREFIX, tags=["live"])
 
 
 # --- Generic error handler ------------------------------------------------

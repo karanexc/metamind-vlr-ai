@@ -16,6 +16,7 @@ import {
 import { Select } from '@/components/ui/select';
 import { StatTile } from '@/components/ui/stat-tile';
 import { PlayerAvatar, TeamLogo } from '@/components/ui/avatar';
+import { Skeleton } from '@/components/ui/skeleton';
 import { cn, countryFlag } from '@/lib/utils';
 
 type Region = 'americas' | 'emea' | 'pacific' | 'china';
@@ -137,8 +138,10 @@ export default function PlayersPage() {
           Top 5 in {REGIONS.find((r) => r.value === region)?.label} · last 120 days
         </div>
         {topTeams.length === 0 ? (
-          <div className="bg-surface border border-border rounded-2xl p-10 text-center text-sm text-ink-dim">
-            Loading top teams...
+          <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
+            {Array.from({ length: 5 }).map((_, i) => (
+              <Skeleton key={i} className="h-[132px] rounded-2xl" />
+            ))}
           </div>
         ) : (
           <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
@@ -211,8 +214,10 @@ export default function PlayersPage() {
               {selectedTeam.name} roster
             </div>
             {roster.length === 0 ? (
-              <div className="bg-surface border border-border rounded-2xl p-8 text-center text-sm text-ink-dim">
-                Loading roster...
+              <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
+                {Array.from({ length: 5 }).map((_, i) => (
+                  <Skeleton key={i} className="aspect-[4/5] rounded-2xl" />
+                ))}
               </div>
             ) : (
               <div className="grid grid-cols-2 md:grid-cols-5 gap-3">

@@ -431,7 +431,8 @@ def scrape_recent_results(pages: int = 1) -> int:
     """
     try:
         result = scrape_recent(pages=pages, force=False)
-        return result.get("inserted", 0) + result.get("updated", 0)
+        # `_scrape_listings` reports newly-persisted matches under "ok".
+        return result.get("ok", 0)
     except Exception:
         log.exception("scrape_recent_results failed")
         return 0

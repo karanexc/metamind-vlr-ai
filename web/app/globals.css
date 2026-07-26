@@ -110,6 +110,21 @@
     -webkit-text-fill-color: transparent;
   }
 
+  /* Marquee — infinite horizontal scroll; pauses on hover of .marquee */
+  @keyframes marquee {
+    from { transform: translateX(0); }
+    to { transform: translateX(-50%); }
+  }
+  .animate-marquee {
+    animation: marquee 45s linear infinite;
+  }
+  .marquee:hover .animate-marquee {
+    animation-play-state: paused;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .animate-marquee { animation: none; }
+  }
+
   /* Animated grid background (subtle) */
   .grid-bg {
     background-image:

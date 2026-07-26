@@ -171,6 +171,44 @@ export interface TopPlayer {
   avg_metric: number;
 }
 
+export interface LiveStatus {
+  enabled: boolean;
+  interval_minutes: number;
+  status: string;
+  last_run: string | null;
+  last_inserted: number | null;
+  next_run: string | null;
+}
+
+export interface RefreshResult {
+  inserted: number;
+  ran_at: string | null;
+}
+
+export interface EventTeam {
+  id: number;
+  name: string;
+}
+
+export interface PickemForecastItem {
+  team_id: number;
+  team_name: string;
+  champion_prob: number;
+  expected_wins: number;
+  win_rate: number;
+  avg_win_prob: number;
+}
+
+export interface PickemForecast {
+  format: string;
+  best_of: number;
+  n_sims: number;
+  n_teams: number;
+  teams: PickemForecastItem[];
+  unavailable: string[];
+  note: string;
+}
+
 export interface RegionalTeam {
   id: number;
   name: string;
@@ -260,4 +298,17 @@ export const api = {
     request<LossAnalysis>(
       `/api/v1/explain/${matchId}${regenerate ? '?regenerate=true' : ''}`,
     ),
+
+  // Live scrape
+  liveStatus: () => request<LiveStatus>('/api/v1/live/status'),
+  refresh: () => request<RefreshResult>('/api/v1/live/refresh', { method: 'POST' }),
+
+  // Pick'em
+  eventTeams: (eventId: number) =>
+    request<EventTeam[]>(`/api/v1/pickem/events/${eventId}/teams`),
+  pickemForecast: (teamIds: number[], bestOf: number) =>
+    request<PickemForecast>('/api/v1/pickem/forecast', {
+      method: 'POST',
+      body: JSON.stringify({ team_ids: teamIds, best_of: bestOf }),
+    }),
 };

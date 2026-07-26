@@ -182,3 +182,53 @@ class TopPlayer(BaseModel):
     player: str
     n_maps: int
     avg_metric: float
+
+
+# --- Live scrape ---------------------------------------------------------
+
+
+class LiveStatus(BaseModel):
+    enabled: bool
+    interval_minutes: int
+    status: str
+    last_run: Optional[str] = None
+    last_inserted: Optional[int] = None
+    next_run: Optional[str] = None
+
+
+class RefreshResult(BaseModel):
+    inserted: int
+    ran_at: Optional[str] = None
+
+
+# --- Pick'em / event forecast --------------------------------------------
+
+
+class EventTeam(BaseModel):
+    id: int
+    name: str
+
+
+class PickemRequest(BaseModel):
+    team_ids: list[int]
+    best_of: int = 3
+    n_sims: int = 20000
+
+
+class PickemForecastItem(BaseModel):
+    team_id: int
+    team_name: str
+    champion_prob: float
+    expected_wins: float
+    win_rate: float
+    avg_win_prob: float
+
+
+class PickemForecast(BaseModel):
+    format: str
+    best_of: int
+    n_sims: int
+    n_teams: int
+    teams: list[PickemForecastItem]
+    unavailable: list[str]
+    note: str = ""

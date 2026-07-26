@@ -2,6 +2,8 @@ import type { Metadata } from 'next';
 import './globals.css';
 import { Nav } from '@/components/layout/nav';
 import { Footer } from '@/components/layout/footer';
+import { AmbientBackground } from '@/components/layout/ambient-background';
+import { HudRails } from '@/components/layout/hud-rails';
 
 export const metadata: Metadata = {
   title: 'VLR Analytics — Valorant match intelligence',
@@ -13,6 +15,8 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
   return (
     <html lang="en" className="dark">
       <body className="min-h-screen flex flex-col">
+        <AmbientBackground />
+        <HudRails />
         <Nav />
         <main className="flex-1">{children}</main>
         <Footer />

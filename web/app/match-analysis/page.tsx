@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { RefreshCw, ArrowUp, ArrowDown } from 'lucide-react';
+import { RefreshCw, ArrowUp, ArrowDown, Sparkles, FileText, ListChecks, Users } from 'lucide-react';
 import { api, type MatchListItem, type MatchDetail, type LossAnalysis } from '@/lib/api';
 import { Select } from '@/components/ui/select';
 import { Button } from '@/components/ui/button';
@@ -109,6 +109,49 @@ export default function MatchAnalysisPage() {
           disabled={matches.length === 0}
         />
       </motion.div>
+
+      {matchId === null && (
+        <motion.div
+          initial={{ opacity: 0, y: 10 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ delay: 0.2 }}
+          className="mt-10"
+        >
+          <div className="relative bg-gradient-card border border-border rounded-3xl p-8 overflow-hidden">
+            <div className="absolute inset-0 grid-bg opacity-30 pointer-events-none" />
+            <div className="absolute -top-24 left-1/2 -translate-x-1/2 w-80 h-80 bg-accent/10 rounded-full blur-[100px]" />
+            <div className="relative">
+              <div className="flex items-center gap-2 text-[0.7rem] font-medium uppercase tracking-widest text-ink-dim mb-5">
+                <Sparkles className="w-3.5 h-3.5 text-accent" />
+                What you&apos;ll get
+              </div>
+              <div className="grid md:grid-cols-3 gap-4">
+                {[
+                  { icon: FileText, title: 'Narrative summary', body: 'A coach-style paragraph on how the match was won and lost.' },
+                  { icon: ListChecks, title: 'Key factors', body: 'The SHAP-ranked features that swung the result.' },
+                  { icon: Users, title: 'Standouts & slumps', body: 'Who carried, who underperformed, grounded in stats.' },
+                ].map((c, i) => (
+                  <motion.div
+                    key={c.title}
+                    animate={{ opacity: [0.6, 1, 0.6] }}
+                    transition={{ duration: 3, repeat: Infinity, delay: i * 0.4 }}
+                    className="bg-surface/60 border border-dashed border-border rounded-2xl p-5"
+                  >
+                    <div className="w-9 h-9 rounded-lg bg-accent/10 border border-accent/20 flex items-center justify-center mb-3">
+                      <c.icon className="w-5 h-5 text-accent" />
+                    </div>
+                    <div className="text-sm font-semibold text-ink mb-1">{c.title}</div>
+                    <div className="text-xs text-ink-soft leading-relaxed">{c.body}</div>
+                  </motion.div>
+                ))}
+              </div>
+              <div className="mt-6 text-center text-sm text-ink-dim">
+                Pick a tier and a match above to generate its AI breakdown.
+              </div>
+            </div>
+          </div>
+        </motion.div>
+      )}
 
       <AnimatePresence mode="wait">
         {match && (
