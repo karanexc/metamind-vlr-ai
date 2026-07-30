@@ -232,3 +232,66 @@ class PickemForecast(BaseModel):
     teams: list[PickemForecastItem]
     unavailable: list[str]
     note: str = ""
+
+
+# --- Agent meta ----------------------------------------------------------
+
+
+class AgentMetaItem(BaseModel):
+    agent: str
+    picks: int
+    pick_rate: float
+    win_rate: float
+    avg_rating: float
+    avg_acs: float
+
+
+# --- Player depth analysis -----------------------------------------------
+
+
+class EventPlayer(BaseModel):
+    id: int
+    name: str
+    n_maps: int
+
+
+class PlayerEventMap(BaseModel):
+    index: int
+    map_name: Optional[str] = None
+    opponent: Optional[str] = None
+    agent: Optional[str] = None
+    rating: float
+    acs: int
+    kills: int
+    deaths: int
+    kast: int
+    adr: float
+    hs: int
+    won: bool
+    stage: Optional[str] = None
+
+
+class PlayerEventAgent(BaseModel):
+    agent: str
+    maps: int
+    avg_rating: float
+    avg_acs: float
+
+
+class PlayerEventAnalysis(BaseModel):
+    player_id: int
+    player_name: str
+    event_id: int
+    event_name: str
+    n_maps: int
+    map_wins: int
+    map_win_rate: float
+    avg_rating: float
+    avg_acs: float
+    avg_kast: float
+    avg_adr: float
+    avg_hs: float
+    total_kills: int
+    total_deaths: int
+    series: list[PlayerEventMap]
+    per_agent: list[PlayerEventAgent]

@@ -10,9 +10,12 @@ import { cn } from '@/lib/utils';
 const navItems = [
   { href: '/', label: 'Home' },
   { href: '/predict', label: 'Predict' },
-  { href: '/match-analysis', label: 'Match Analysis' },
+  { href: '/match-analysis', label: 'Analysis' },
   { href: '/fantasy', label: 'Fantasy' },
   { href: '/pickem', label: "Pick'em" },
+  { href: '/meta', label: 'Meta' },
+  { href: '/compare', label: 'Compare' },
+  { href: '/depth', label: 'Depth' },
   { href: '/teams', label: 'Teams' },
   { href: '/players', label: 'Players' },
 ];

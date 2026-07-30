@@ -572,7 +572,132 @@ def _parse_player_row(row: Tag, team_index: int) -> Optional[PlayerStat]:
     )
 
 
+def _cls_str(el: Tag) -> str:
+    c = el.get("class") or []
+    return " ".join(c) if isinstance(c, list) else str(c)
+
+
+def _both_cell_value(cell: Tag) -> Optional[str]:
+    """Value from a new-layout stat cell — prefer the combined `.side.mod-both`
+    span, else the first numeric-ish token in the cell."""
+    if cell is None:
+        return None
+    both = cell.select_one(".side.mod-both")
+    if both is not None:
+        text = _strip(both.get_text())
+        if text:
+            return text
+    text = cell.get_text(" ", strip=True)
+    for token in text.split():
+        stripped = token.rstrip("%").lstrip("+-")
+        if stripped and stripped.replace(".", "", 1).isdigit():
+            return token
+    return _strip(text)
+
+
+def _parse_player_cell_div(
+    player_cell: Tag, stat_cells: list[Tag], team_index: int
+) -> Optional[PlayerStat]:
+    """Parse one player from vlr's new div layout: a `.ovw-cell.mod-player`
+    (name + agent) followed by stat cells keyed by `data-col`. The `kills` cell
+    is `.mod-kda` and holds K/D/A in `.ovw-kda-stat` sub-elements."""
+    a = player_cell.find("a", href=PLAYER_URL_RE)
+    if a is None:
+        return None
+    m = PLAYER_URL_RE.match(a.get("href", ""))
+    if not m:
+        return None
+    player_id = int(m.group(1))
+
+    name_node = player_cell.select_one(".ovw-player-name")
+    player_name = _strip(name_node.get_text()) if name_node else _strip(a.get_text())
+    if not player_name:
+        return None
+
+    tag_node = player_cell.select_one(".ovw-player-tag")
+    team_tag = _strip(tag_node.get_text()) if tag_node else None
+
+    agent = None
+    agent_img = player_cell.select_one(".ovw-agents img")
+    if agent_img is not None:
+        agent = (agent_img.get("title") or agent_img.get("alt") or "").strip().lower() or None
+        if not agent:
+            am = re.search(r"/agents/([a-zA-Z0-9_\-]+)\.(?:png|webp|jpg)", agent_img.get("src", ""))
+            if am:
+                agent = am.group(1).lower()
+
+    values: dict[str, Optional[str]] = {}
+    kills = deaths = assists = None
+    for cell in stat_cells:
+        if "mod-kda" in _cls_str(cell):
+            for ks in cell.select(".ovw-kda-stat"):
+                kdc = ks.get("data-col", "")
+                both = ks.select_one(".side.mod-both")
+                val = _strip(both.get_text()) if both else _strip(ks.get_text())
+                if kdc == "kills":
+                    kills = val
+                elif kdc == "deaths":
+                    deaths = val
+                elif kdc == "assists":
+                    assists = val
+            continue
+        data_col = cell.get("data-col", "")
+        if data_col:
+            values[data_col] = _both_cell_value(cell)
+
+    return PlayerStat(
+        player_id=player_id,
+        player_name=player_name,
+        team_name=team_tag,
+        team_index=team_index,
+        agent=agent,
+        rating=_float_or_none(values.get("rating2")),
+        acs=_int_or_none(values.get("acs")),
+        kills=_int_or_none(kills),
+        deaths=_int_or_none(deaths),
+        assists=_int_or_none(assists),
+        plus_minus=_int_or_none(values.get("kd-diff")),
+        kast=_percent_or_none(values.get("kast")),
+        adr=_float_or_none(values.get("adr")),
+        hs_pct=_percent_or_none(values.get("hsp")),
+        fk=_int_or_none(values.get("fb")),
+        fd=_int_or_none(values.get("fd")),
+        fk_fd_diff=_int_or_none(values.get("fk-diff")),
+    )
+
+
+def _extract_player_stats_div(block: Tag) -> list[PlayerStat]:
+    """New div-based per-map player stats. Player cells are `.ovw-cell.mod-player`;
+    the rest are stat cells, evenly split per player. First half = team A
+    (index 0), second half = team B (index 1)."""
+    all_cells = block.select(".ovw-cell")
+    if not all_cells:
+        return []
+    player_cells = [c for c in all_cells if "mod-player" in _cls_str(c)]
+    non_player = [c for c in all_cells if "mod-player" not in _cls_str(c)]
+    n = len(player_cells)
+    if n < 2:
+        return []
+    stats_per = len(non_player) // n
+    if stats_per == 0:
+        return []
+    half = n // 2
+    stats: list[PlayerStat] = []
+    for i, pcell in enumerate(player_cells):
+        team_index = 0 if i < half else 1
+        group = non_player[i * stats_per:(i + 1) * stats_per]
+        ps = _parse_player_cell_div(pcell, group, team_index)
+        if ps is not None:
+            stats.append(ps)
+    return stats
+
+
 def _extract_player_stats(block: Tag) -> list[PlayerStat]:
+    # vlr's current match pages are div-based (`.ovw-cell`); older/cached pages
+    # used <table> rows. Try the new layout first, fall back to the old one.
+    div_stats = _extract_player_stats_div(block)
+    if div_stats:
+        return div_stats
     stats: list[PlayerStat] = []
     tbodies = block.find_all("tbody")
     for team_index, tbody in enumerate(tbodies[:2]):
@@ -598,7 +723,9 @@ def _parse_maps(soup: BeautifulSoup) -> list[MapResult]:
     container = soup.find("div", class_=re.compile(r"\bvm-stats-container\b"))
     if container is None:
         candidates = soup.find_all("div", class_=re.compile(r"\bvm-stats-game\b"))
-        blocks = [b for b in candidates if b.find("tbody") is not None]
+        # Keep blocks that carry stats in either the new div layout (.ovw-cell)
+        # or the old table layout (<tbody>).
+        blocks = [b for b in candidates if b.select(".ovw-cell") or b.find("tbody") is not None]
     else:
         blocks = container.find_all("div", class_=re.compile(r"\bvm-stats-game\b"))
 
@@ -694,7 +821,10 @@ def parse_match_detail(html: str, match_url: str) -> MatchDetail:
     event_id, event_name, stage_from_event = _extract_event_info(soup)
 
     score_a = score_b = None
-    score_nodes = soup.select(".match-header-vs-score .js-spoiler span")
+    # New vlr layout uses .match-header-vs-score-winner/-loser spans; the old
+    # layout used .js-spoiler spans. Both sit under .match-header-vs-score, so
+    # take every span there and keep the digits in document (team) order.
+    score_nodes = soup.select(".match-header-vs-score span")
     score_ints = [_int_or_none(_strip(n.get_text())) for n in score_nodes]
     score_ints = [s for s in score_ints if s is not None]
     if len(score_ints) >= 2:

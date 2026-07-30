@@ -1,5 +1,7 @@
 // Single source of truth for talking to the backend.
 
+import { resolveMock } from './mock-data';
+
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
 
 class ApiError extends Error {
@@ -9,13 +11,21 @@ class ApiError extends Error {
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`${API_URL}${path}`, {
-    ...init,
-    headers: {
-      'Content-Type': 'application/json',
-      ...(init?.headers || {}),
-    },
-  });
+  let res: Response;
+  try {
+    res = await fetch(`${API_URL}${path}`, {
+      ...init,
+      headers: {
+        'Content-Type': 'application/json',
+        ...(init?.headers || {}),
+      },
+    });
+  } catch (netErr) {
+    // Backend unreachable (e.g. no server running) → offline sample data.
+    const mock = resolveMock(path, init);
+    if (mock !== undefined) return mock as T;
+    throw netErr;
+  }
 
   if (!res.ok) {
     let body: unknown;
@@ -209,6 +219,63 @@ export interface PickemForecast {
   note: string;
 }
 
+export interface AgentMetaItem {
+  agent: string;
+  picks: number;
+  pick_rate: number;
+  win_rate: number;
+  avg_rating: number;
+  avg_acs: number;
+}
+
+export interface EventPlayer {
+  id: number;
+  name: string;
+  n_maps: number;
+}
+
+export interface PlayerEventMap {
+  index: number;
+  map_name: string | null;
+  opponent: string | null;
+  agent: string | null;
+  rating: number;
+  acs: number;
+  kills: number;
+  deaths: number;
+  kast: number;
+  adr: number;
+  hs: number;
+  won: boolean;
+  stage: string | null;
+}
+
+export interface PlayerEventAgent {
+  agent: string;
+  maps: number;
+  avg_rating: number;
+  avg_acs: number;
+}
+
+export interface PlayerEventAnalysis {
+  player_id: number;
+  player_name: string;
+  event_id: number;
+  event_name: string;
+  n_maps: number;
+  map_wins: number;
+  map_win_rate: number;
+  avg_rating: number;
+  avg_acs: number;
+  avg_kast: number;
+  avg_adr: number;
+  avg_hs: number;
+  total_kills: number;
+  total_deaths: number;
+  series: PlayerEventMap[];
+  per_agent: PlayerEventAgent[];
+}
+
 export interface RegionalTeam {
   id: number;
   name: string;
@@ -311,4 +378,17 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ team_ids: teamIds, best_of: bestOf }),
     }),
+
+  // Agent meta
+  metaMaps: () => request<string[]>('/api/v1/meta/maps'),
+  metaAgents: (map?: string, minPicks = 20) =>
+    request<AgentMetaItem[]>(
+      `/api/v1/meta/agents?min_picks=${minPicks}${map ? `&map=${encodeURIComponent(map)}` : ''}`,
+    ),
+
+  // Player depth analysis
+  eventPlayers: (eventId: number) =>
+    request<EventPlayer[]>(`/api/v1/depth/events/${eventId}/players`),
+  playerEventAnalysis: (eventId: number, playerId: number) =>
+    request<PlayerEventAnalysis>(`/api/v1/depth/events/${eventId}/players/${playerId}`),
 };

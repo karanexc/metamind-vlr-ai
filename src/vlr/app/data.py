@@ -137,6 +137,204 @@ def get_event_teams(event_id: int) -> list[tuple[int, str]]:
         session.close()
 
 
+# --- Agent meta ----------------------------------------------------------
+
+
+@st.cache_data(ttl=600)
+def get_map_names() -> list[str]:
+    """Distinct map names present in the data (for the meta map filter)."""
+    session = get_session()
+    try:
+        rows = session.execute(sql_text("""
+            SELECT DISTINCT map_name
+            FROM maps_played
+            WHERE map_name IS NOT NULL AND map_name != ''
+            ORDER BY map_name ASC
+        """)).all()
+        return [r[0] for r in rows]
+    finally:
+        session.close()
+
+
+@st.cache_data(ttl=600)
+def get_agent_meta(map_name: Optional[str] = None, min_picks: int = 20) -> list[dict]:
+    """Per-agent meta: pick share, win rate, avg rating/ACS.
+
+    Computed over decided maps where the player's team is known (so we can
+    attribute the map win). Optionally scoped to a single map.
+    """
+    session = get_session()
+    try:
+        where_map = "AND mp.map_name = :map_name" if map_name else ""
+        rows = session.execute(sql_text(f"""
+            SELECT pms.agent AS agent,
+                   COUNT(*) AS picks,
+                   AVG(pms.rating) AS avg_rating,
+                   AVG(pms.acs) AS avg_acs,
+                   SUM(CASE
+                         WHEN (pms.team_id = m.team_a_id AND mp.score_a > mp.score_b)
+                           OR (pms.team_id = m.team_b_id AND mp.score_b > mp.score_a)
+                         THEN 1 ELSE 0 END) AS wins
+            FROM player_map_stats pms
+            JOIN maps_played mp ON mp.id = pms.map_id
+            JOIN matches m ON m.id = pms.match_id
+            WHERE pms.agent IS NOT NULL AND pms.agent != ''
+              AND pms.team_id IS NOT NULL
+              AND mp.score_a IS NOT NULL AND mp.score_b IS NOT NULL
+              AND mp.score_a != mp.score_b
+              {where_map}
+            GROUP BY pms.agent
+            HAVING COUNT(*) >= :min_picks
+            ORDER BY picks DESC
+        """), {"map_name": map_name, "min_picks": min_picks}).all()
+
+        total = sum(int(r.picks) for r in rows) or 1
+        out = []
+        for r in rows:
+            picks = int(r.picks)
+            out.append({
+                "agent": r.agent,
+                "picks": picks,
+                "pick_rate": round(picks / total * 100, 1),
+                "win_rate": round((int(r.wins or 0)) / picks * 100, 1),
+                "avg_rating": round(float(r.avg_rating or 0), 2),
+                "avg_acs": round(float(r.avg_acs or 0)),
+            })
+        return out
+    finally:
+        session.close()
+
+
+# --- Player depth analysis (per-tournament) ------------------------------
+
+
+@st.cache_data(ttl=600)
+def get_event_players(event_id: int) -> list[tuple[int, str, int]]:
+    """Players who played in an event, with maps-in-event count. (id, name, n_maps)."""
+    session = get_session()
+    try:
+        rows = session.execute(sql_text("""
+            SELECT p.id, p.name, COUNT(*) AS n_maps
+            FROM player_map_stats pms
+            JOIN players p ON p.id = pms.player_id
+            JOIN matches m ON m.id = pms.match_id
+            WHERE m.event_id = :eid AND pms.rating IS NOT NULL
+            GROUP BY p.id, p.name
+            ORDER BY n_maps DESC, p.name ASC
+        """), {"eid": event_id}).all()
+        return [(r[0], r[1], r[2]) for r in rows]
+    finally:
+        session.close()
+
+
+@st.cache_data(ttl=600)
+def get_player_event_analysis(player_id: int, event_id: int) -> Optional[dict]:
+    """A player's per-map performance timeline within one event, plus aggregates
+    and a per-agent breakdown. Maps are ordered chronologically."""
+    session = get_session()
+    try:
+        player = session.get(Player, player_id)
+        event = session.get(Event, event_id)
+        if player is None or event is None:
+            return None
+
+        rows = session.execute(sql_text("""
+            SELECT m.match_datetime, m.stage,
+                   m.team_a_id, m.team_b_id, m.team_a_name, m.team_b_name,
+                   mp.map_index, mp.map_name, mp.score_a, mp.score_b,
+                   pms.team_id, pms.agent, pms.rating, pms.acs, pms.kills,
+                   pms.deaths, pms.assists, pms.kast, pms.adr, pms.hs_pct
+            FROM player_map_stats pms
+            JOIN maps_played mp ON mp.id = pms.map_id
+            JOIN matches m ON m.id = pms.match_id
+            WHERE pms.player_id = :pid AND m.event_id = :eid AND pms.rating IS NOT NULL
+            ORDER BY m.match_datetime ASC NULLS LAST, mp.map_index ASC
+        """), {"pid": player_id, "eid": event_id}).all()
+
+        if not rows:
+            return None
+
+        series: list[dict] = []
+        agg = {"rating": 0.0, "acs": 0, "kast": 0, "adr": 0.0, "hs": 0, "kills": 0, "deaths": 0}
+        per_agent: dict[str, dict] = {}
+        wins = 0
+
+        for i, r in enumerate(rows):
+            if r.team_id is not None and r.team_id == r.team_a_id:
+                opp = r.team_b_name
+                won = (r.score_a or 0) > (r.score_b or 0)
+            elif r.team_id is not None and r.team_id == r.team_b_id:
+                opp = r.team_a_name
+                won = (r.score_b or 0) > (r.score_a or 0)
+            else:
+                opp = None
+                won = False
+
+            series.append({
+                "index": i + 1,
+                "map_name": r.map_name,
+                "opponent": opp,
+                "agent": r.agent,
+                "rating": round(float(r.rating or 0), 2),
+                "acs": int(r.acs or 0),
+                "kills": int(r.kills or 0),
+                "deaths": int(r.deaths or 0),
+                "kast": int(r.kast or 0),
+                "adr": round(float(r.adr or 0), 1),
+                "hs": int(r.hs_pct or 0),
+                "won": bool(won),
+                "stage": r.stage,
+            })
+
+            agg["rating"] += float(r.rating or 0)
+            agg["acs"] += int(r.acs or 0)
+            agg["kast"] += int(r.kast or 0)
+            agg["adr"] += float(r.adr or 0)
+            agg["hs"] += int(r.hs_pct or 0)
+            agg["kills"] += int(r.kills or 0)
+            agg["deaths"] += int(r.deaths or 0)
+            if won:
+                wins += 1
+            if r.agent:
+                a = per_agent.setdefault(r.agent, {"agent": r.agent, "maps": 0, "rating": 0.0, "acs": 0})
+                a["maps"] += 1
+                a["rating"] += float(r.rating or 0)
+                a["acs"] += int(r.acs or 0)
+
+        n = len(series)
+        per_agent_list = [
+            {
+                "agent": a["agent"],
+                "maps": a["maps"],
+                "avg_rating": round(a["rating"] / a["maps"], 2),
+                "avg_acs": round(a["acs"] / a["maps"]),
+            }
+            for a in per_agent.values()
+        ]
+        per_agent_list.sort(key=lambda x: x["maps"], reverse=True)
+
+        return {
+            "player_id": player_id,
+            "player_name": player.name,
+            "event_id": event_id,
+            "event_name": event.name,
+            "n_maps": n,
+            "map_wins": wins,
+            "map_win_rate": round(wins / n * 100, 1) if n else 0.0,
+            "avg_rating": round(agg["rating"] / n, 2),
+            "avg_acs": round(agg["acs"] / n),
+            "avg_kast": round(agg["kast"] / n),
+            "avg_adr": round(agg["adr"] / n, 1),
+            "avg_hs": round(agg["hs"] / n),
+            "total_kills": agg["kills"],
+            "total_deaths": agg["deaths"],
+            "series": series,
+            "per_agent": per_agent_list,
+        }
+    finally:
+        session.close()
+
+
 # --- Team listings -------------------------------------------------------
 
 

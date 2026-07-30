@@ -1,6 +1,7 @@
 'use client';
 
 import { motion, useReducedMotion } from 'framer-motion';
+import { TacticalCanvas } from './tactical-canvas';
 
 /**
  * Fixed, full-viewport decorative layer that sits behind all page content.
@@ -14,7 +15,7 @@ export function AmbientBackground() {
   return (
     <div
       aria-hidden
-      className="fixed inset-0 -z-10 overflow-hidden pointer-events-none"
+      className="fixed inset-0 z-0 overflow-hidden pointer-events-none"
     >
       {/* Faint grid */}
       <div className="absolute inset-0 grid-bg opacity-40" />
@@ -45,6 +46,10 @@ export function AmbientBackground() {
 
       {/* Bottom vignette so content grounds into the page */}
       <div className="absolute inset-0 bg-gradient-to-b from-transparent via-transparent to-bg/80" />
+
+      {/* Interactive tactical layer on top of the ambient wash (still behind
+          all page content, since this whole layer is -z-10) */}
+      <TacticalCanvas />
     </div>
   );
 }

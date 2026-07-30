@@ -9,7 +9,7 @@ next tick proceeds normally.
 
 Config via environment:
   LIVE_SCRAPE_ENABLED       "true"/"false"  (default true)
-  LIVE_SCRAPE_INTERVAL_MIN  minutes between scrapes (default 720 = 12h)
+  LIVE_SCRAPE_INTERVAL_MIN  minutes between scrapes (default 120 = 2h)
   LIVE_SCRAPE_PAGES         results pages to scrape per tick (default 1)
 """
 from __future__ import annotations
@@ -25,8 +25,8 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 log = logging.getLogger(__name__)
 
 
-# Interval in minutes between scrapes. Default 12h; configurable via env.
-_INTERVAL_MIN = int(os.environ.get("LIVE_SCRAPE_INTERVAL_MIN", "720"))
+# Interval in minutes between scrapes. Default 2h; configurable via env.
+_INTERVAL_MIN = int(os.environ.get("LIVE_SCRAPE_INTERVAL_MIN", "120"))
 _PAGES = int(os.environ.get("LIVE_SCRAPE_PAGES", "1"))
 _ENABLED = os.environ.get("LIVE_SCRAPE_ENABLED", "true").lower() == "true"
 
