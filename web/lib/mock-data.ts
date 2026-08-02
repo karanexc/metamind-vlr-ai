@@ -16,14 +16,14 @@ const r2 = (n: number) => Math.round(n * 100) / 100;
 
 // --- Teams ---------------------------------------------------------------
 const TEAM_DEFS = [
-  { id: 8001, name: 'Sentinels', region: 'americas', country: 'us' },
-  { id: 8002, name: 'LOUD', region: 'americas', country: 'br' },
-  { id: 8003, name: 'Fnatic', region: 'emea', country: 'gb' },
-  { id: 8004, name: 'Paper Rex', region: 'pacific', country: 'sg' },
-  { id: 8005, name: 'DRX', region: 'pacific', country: 'kr' },
-  { id: 8006, name: 'Team Heretics', region: 'emea', country: 'es' },
+  { id: 8001, name: 'Sentinels', region: 'north-america', country: 'us' },
+  { id: 8002, name: 'LOUD', region: 'brazil', country: 'br' },
+  { id: 8003, name: 'Fnatic', region: 'europe', country: 'gb' },
+  { id: 8004, name: 'Paper Rex', region: 'asia-pacific', country: 'sg' },
+  { id: 8005, name: 'DRX', region: 'korea', country: 'kr' },
+  { id: 8006, name: 'Team Heretics', region: 'europe', country: 'es' },
   { id: 8007, name: 'EDward Gaming', region: 'china', country: 'cn' },
-  { id: 8008, name: 'G2 Esports', region: 'americas', country: 'us' },
+  { id: 8008, name: 'G2 Esports', region: 'north-america', country: 'us' },
 ];
 
 const ROSTERS: Record<number, string[]> = {
@@ -254,6 +254,8 @@ function leaderboardTeam(id: number, rank: number) {
     logo_url: null,
     country: t.country,
     region: t.region,
+    vlr_rating: 2000 - rank * 32,
+    vlr_rank: rank + 1,
     matches_played: wins + losses,
     wins,
     losses,
@@ -405,7 +407,7 @@ export function resolveMock(rawPath: string, init?: RequestInit): any {
       : TEAM_DEFS;
     return ranked.slice(0, 5).map((t, i) => {
       const lb = leaderboardTeam(t.id, i);
-      return { id: lb.id, name: lb.name, logo_url: null, country: lb.country, matches_played: lb.matches_played, wins: lb.wins, losses: lb.losses, win_pct: lb.win_pct };
+      return { id: lb.id, name: lb.name, logo_url: null, country: lb.country, vlr_rating: lb.vlr_rating, vlr_rank: lb.vlr_rank, matches_played: lb.matches_played, wins: lb.wins, losses: lb.losses, win_pct: lb.win_pct };
     });
   }
   if (seg[0] === 'regions' && seg[2] === 'teams-leaderboard') {
@@ -514,10 +516,10 @@ export function resolveMock(rawPath: string, init?: RequestInit): any {
 
   // live
   if (path === '/live/status') {
-    return { enabled: true, interval_minutes: 120, status: 'ok', last_run: MATCHES[MATCHES.length - 1].datetime, last_inserted: 3, next_run: null };
+    return { enabled: true, interval_minutes: 300, status: 'ok', running: false, last_run: MATCHES[MATCHES.length - 1].datetime, last_result: null, next_run: null };
   }
   if (path === '/live/refresh') {
-    return { inserted: 0, ran_at: MATCHES[MATCHES.length - 1].datetime };
+    return { status: 'started', started: true };
   }
 
   return undefined;

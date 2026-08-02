@@ -11,7 +11,7 @@ the timer or a manual click), another trigger is skipped rather than run twice.
 
 Config via environment:
   LIVE_SCRAPE_ENABLED       "true"/"false"  (default true)
-  LIVE_SCRAPE_INTERVAL_MIN  minutes between refreshes (default 120 = 2h)
+  LIVE_SCRAPE_INTERVAL_MIN  minutes between refreshes (default 300 = 5h)
   LIVE_SCRAPE_PAGES         results pages scraped per refresh (default 1)
 """
 from __future__ import annotations
@@ -26,7 +26,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 log = logging.getLogger(__name__)
 
-_INTERVAL_MIN = int(os.environ.get("LIVE_SCRAPE_INTERVAL_MIN", "120"))  # 2 hours
+_INTERVAL_MIN = int(os.environ.get("LIVE_SCRAPE_INTERVAL_MIN", "300"))  # 5 hours
 _PAGES = int(os.environ.get("LIVE_SCRAPE_PAGES", "1"))
 _ENABLED = os.environ.get("LIVE_SCRAPE_ENABLED", "true").lower() == "true"
 

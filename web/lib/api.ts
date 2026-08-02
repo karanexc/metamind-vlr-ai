@@ -185,14 +185,15 @@ export interface LiveStatus {
   enabled: boolean;
   interval_minutes: number;
   status: string;
+  running: boolean;
   last_run: string | null;
-  last_inserted: number | null;
+  last_result: Record<string, unknown> | null;
   next_run: string | null;
 }
 
 export interface RefreshResult {
-  inserted: number;
-  ran_at: string | null;
+  status: string;
+  started: boolean;
 }
 
 export interface EventTeam {
@@ -285,6 +286,8 @@ export interface RegionalTeam {
   wins: number;
   losses: number;
   win_pct: number;
+  vlr_rating?: number | null;
+  vlr_rank?: number | null;
 }
 
 export interface TeamRosterPlayer {

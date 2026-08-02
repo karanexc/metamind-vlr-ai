@@ -7,19 +7,15 @@ import { api, type LeaderboardTeam } from '@/lib/api';
 import { PlayerAvatar, TeamLogo } from '@/components/ui/avatar';
 import { Skeleton } from '@/components/ui/skeleton';
 import { cn, countryFlag } from '@/lib/utils';
+import { VLR_REGIONS, regionLabel } from '@/lib/regions';
 
-type RegionFilter = 'all' | 'americas' | 'emea' | 'pacific' | 'china';
-
-const REGIONS: { value: RegionFilter; label: string }[] = [
+const REGIONS: { value: string; label: string }[] = [
   { value: 'all', label: 'All Regions' },
-  { value: 'americas', label: 'Americas' },
-  { value: 'emea', label: 'EMEA' },
-  { value: 'pacific', label: 'Pacific' },
-  { value: 'china', label: 'China' },
+  ...VLR_REGIONS.map((r) => ({ value: r.slug, label: r.label })),
 ];
 
 export default function TeamsPage() {
-  const [region, setRegion] = useState<RegionFilter>('all');
+  const [region, setRegion] = useState<string>('all');
   const [teams, setTeams] = useState<LeaderboardTeam[]>([]);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState('');
@@ -56,8 +52,8 @@ export default function TeamsPage() {
           Valorant world rankings.
         </h1>
         <p className="mt-4 text-base text-ink-soft max-w-2xl">
-          Teams ranked by match win rate over the last 180 days. Minimum 5
-          decided matches required to appear on the leaderboard.
+          Teams ranked by their official vlr.gg rating. Only teams that appear
+          in vlr's regional rankings are listed.
         </p>
       </motion.div>
 
@@ -68,7 +64,7 @@ export default function TeamsPage() {
         transition={{ delay: 0.15 }}
         className="mt-10 flex flex-wrap items-center justify-between gap-4"
       >
-        <div className="flex gap-1 p-1 bg-surface border border-border rounded-xl w-fit">
+        <div className="flex flex-wrap gap-1 p-1 bg-surface border border-border rounded-xl">
           {REGIONS.map((r) => (
             <button
               key={r.value}
@@ -115,7 +111,7 @@ export default function TeamsPage() {
             Region
           </div>
           <div className="text-[0.65rem] font-medium uppercase tracking-widest text-ink-dim">
-            Record
+            Rating
           </div>
           <div className="text-[0.65rem] font-medium uppercase tracking-widest text-ink-dim">
             Roster
@@ -209,20 +205,20 @@ export default function TeamsPage() {
                         )}
                       </div>
                       <div className="text-[0.7rem] text-ink-dim md:hidden mt-0.5">
-                        {team.region || '—'} · {team.wins}W-{team.losses}L
+                        {regionLabel(team.region)} · {team.wins}W-{team.losses}L
                       </div>
                     </div>
                   </div>
 
                   {/* Region (md+) */}
-                  <div className="hidden md:block text-sm text-ink-soft capitalize">
-                    {team.region || '—'}
+                  <div className="hidden md:block text-sm text-ink-soft">
+                    {regionLabel(team.region)}
                   </div>
 
-                  {/* Record + win% (md+) */}
+                  {/* vlr rating + record (md+) */}
                   <div className="hidden md:flex items-baseline gap-2">
                     <div className="font-mono font-semibold text-ink tabular">
-                      {team.win_pct.toFixed(0)}%
+                      {team.vlr_rating ?? '—'}
                     </div>
                     <div className="text-xs text-ink-dim font-mono tabular">
                       {team.wins}–{team.losses}

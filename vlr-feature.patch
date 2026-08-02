@@ -1,0 +1,1207 @@
+diff --git a/src/vlr/api/routes/live.py b/src/vlr/api/routes/live.py
+index b152115..8523cae 100644
+--- a/src/vlr/api/routes/live.py
++++ b/src/vlr/api/routes/live.py
+@@ -2,7 +2,6 @@
+ from __future__ import annotations
+ 
+ from fastapi import APIRouter, Request
+-from starlette.concurrency import run_in_threadpool
+ 
+ from vlr.api.limits import limiter
+ from vlr.api.scheduler import get_status, run_now
+@@ -13,17 +12,16 @@ router = APIRouter()
+ 
+ @router.get("/live/status", response_model=LiveStatus)
+ async def live_status() -> LiveStatus:
+-    """Current state of the background scraper (last run, next run, interval)."""
++    """Current state of the refresh cycle (running?, last run, next run, interval)."""
+     return LiveStatus(**get_status())
+ 
+ 
+ @router.post("/live/refresh", response_model=RefreshResult)
+ @limiter.limit("4/minute")
+ async def live_refresh(request: Request) -> RefreshResult:
+-    """Trigger an immediate scrape of recent results ('Refresh now' button).
++    """Kick off a full data refresh in the background ('Refresh now' button).
+ 
+-    Runs in a threadpool so the network-bound scrape doesn't block the event
+-    loop. Rate limited to protect vlr.gg from hammering.
++    Returns immediately; if a refresh is already running the request is a no-op.
++    Rate limited to protect vlr.gg from hammering.
+     """
+-    res = await run_in_threadpool(run_now)
+-    return RefreshResult(**res)
++    return RefreshResult(**run_now())
+diff --git a/src/vlr/api/routes/teams.py b/src/vlr/api/routes/teams.py
+index 0602dcc..b1c0547 100644
+--- a/src/vlr/api/routes/teams.py
++++ b/src/vlr/api/routes/teams.py
+@@ -5,6 +5,7 @@ from fastapi import APIRouter, HTTPException, Query
+ 
+ from vlr.app import data
+ from vlr.api.schemas import TeamListItem, TeamSummary
++from vlr.regions import VLR_REGION_SET
+ 
+ router = APIRouter()
+ 
+@@ -58,79 +59,56 @@ async def get_team(team_id: int) -> TeamSummary:
+     )
+ 
+ 
++def _wl_from_record(record) -> tuple[int, int]:
++    """Parse a vlr record string like '70–44' into (wins, losses)."""
++    import re
++    if not record:
++        return 0, 0
++    nums = re.findall(r"\d+", str(record))
++    wins = int(nums[0]) if len(nums) >= 1 else 0
++    losses = int(nums[1]) if len(nums) >= 2 else 0
++    return wins, losses
++
++
+ @router.get("/regions/{region}/top-teams")
+ async def regional_top_teams(
+     region: str,
+     limit: int = Query(5, ge=1, le=20),
+-    days: int = Query(120, ge=30, le=365),
+-    min_matches: int = Query(10, ge=1, le=50),
+ ) -> list[dict]:
+-    """Top teams in a region by match win rate over the last `days` days.
+-
+-    Only includes teams with at least `min_matches` decided matches in that
+-    window — filters out small samples where a 2-0 record looks dominant.
+-    """
+-    if region not in {"americas", "emea", "pacific", "china"}:
+-        raise HTTPException(
+-            status_code=400,
+-            detail="region must be 'americas', 'emea', 'pacific', or 'china'",
+-        )
++    """Top teams in a vlr.gg region by official vlr.gg rating."""
++    if region not in VLR_REGION_SET:
++        raise HTTPException(status_code=400, detail=f"unknown region '{region}'")
+ 
+     from vlr.db.session import get_session
+     from sqlalchemy import text as sql_text
+     session = get_session()
+     try:
+         rows = session.execute(sql_text("""
+-            WITH team_results AS (
+-                SELECT t.id AS team_id, t.name AS team_name,
+-                       t.logo_url, t.country,
+-                       CASE WHEN m.score_a > m.score_b THEN 1 ELSE 0 END AS won
+-                FROM matches m
+-                JOIN teams t ON t.id = m.team_a_id
+-                WHERE m.match_datetime >= NOW() - (:days || ' days')::interval
+-                  AND m.score_a IS NOT NULL AND m.score_b IS NOT NULL
+-                  AND t.region = :region
+-
+-                UNION ALL
+-
+-                SELECT t.id AS team_id, t.name AS team_name,
+-                       t.logo_url, t.country,
+-                       CASE WHEN m.score_b > m.score_a THEN 1 ELSE 0 END AS won
+-                FROM matches m
+-                JOIN teams t ON t.id = m.team_b_id
+-                WHERE m.match_datetime >= NOW() - (:days || ' days')::interval
+-                  AND m.score_a IS NOT NULL AND m.score_b IS NOT NULL
+-                  AND t.region = :region
+-            )
+-            SELECT team_id, team_name,
+-                   MAX(logo_url) AS logo_url,
+-                   MAX(country) AS country,
+-                   COUNT(*) AS played,
+-                   SUM(won) AS wins,
+-                   ROUND(100.0 * SUM(won) / NULLIF(COUNT(*), 0), 1) AS win_pct
+-            FROM team_results
+-            GROUP BY team_id, team_name
+-            HAVING COUNT(*) >= :min_matches
+-            ORDER BY win_pct DESC, played DESC
++            SELECT t.id, t.name, t.logo_url, t.country,
++                   t.vlr_rating, t.vlr_rank, t.vlr_record
++            FROM teams t
++            WHERE t.vlr_rating IS NOT NULL AND t.region = :region
++            ORDER BY t.vlr_rating DESC NULLS LAST, t.vlr_rank ASC NULLS LAST
+             LIMIT :limit
+-        """), {
+-            "region": region, "days": days,
+-            "min_matches": min_matches, "limit": limit,
+-        }).all()
++        """), {"region": region, "limit": limit}).all()
+ 
+-        return [
+-            {
++        out = []
++        for r in rows:
++            wins, losses = _wl_from_record(r[6])
++            played = wins + losses
++            out.append({
+                 "id": int(r[0]),
+                 "name": r[1],
+                 "logo_url": r[2],
+                 "country": r[3],
+-                "matches_played": int(r[4]),
+-                "wins": int(r[5]),
+-                "losses": int(r[4]) - int(r[5]),
+-                "win_pct": float(r[6]) if r[6] is not None else 0.0,
+-            }
+-            for r in rows
+-        ]
++                "vlr_rating": int(r[4]) if r[4] is not None else None,
++                "vlr_rank": int(r[5]) if r[5] is not None else None,
++                "matches_played": played,
++                "wins": wins,
++                "losses": losses,
++                "win_pct": round(100.0 * wins / played, 1) if played else 0.0,
++            })
++        return out
+     finally:
+         session.close()
+ 
+@@ -180,60 +158,30 @@ async def team_roster(team_id: int) -> list[dict]:
+ async def regional_teams_leaderboard(
+     region: str,
+     limit: int = Query(50, ge=5, le=100),
+-    days: int = Query(180, ge=30, le=365),
+-    min_matches: int = Query(5, ge=1, le=50),
+ ) -> list[dict]:
+-    """Full leaderboard table for a region. Includes roster, logo, country.
++    """Region leaderboard ranked by official vlr.gg rating, with inline roster.
+ 
+-    This powers the redesigned Teams page (bo3-style dense table).
+-    Returns up to 50 teams per region with their top-5 active roster inline.
++    Powers the Teams page. Only teams that appear in vlr's rankings are shown,
++    ordered by vlr rating (highest first).
+     """
+-    valid = {"americas", "emea", "pacific", "china", "all"}
+-    if region not in valid:
+-        raise HTTPException(status_code=400, detail=f"region must be one of {valid}")
++    if region != "all" and region not in VLR_REGION_SET:
++        raise HTTPException(status_code=400, detail=f"unknown region '{region}'")
+ 
+     from vlr.db.session import get_session
+     from sqlalchemy import text as sql_text
+     session = get_session()
+     try:
+         region_filter = "" if region == "all" else "AND t.region = :region"
+-        params = {"days": days, "min_matches": min_matches, "limit": limit}
++        params = {"limit": limit}
+         if region != "all":
+             params["region"] = region
+ 
+         team_rows = session.execute(sql_text(f"""
+-            WITH team_results AS (
+-                SELECT t.id AS team_id, t.name AS team_name,
+-                       t.region, t.logo_url, t.country,
+-                       CASE WHEN m.score_a > m.score_b THEN 1 ELSE 0 END AS won
+-                FROM matches m
+-                JOIN teams t ON t.id = m.team_a_id
+-                WHERE m.match_datetime >= NOW() - (:days || ' days')::interval
+-                  AND m.score_a IS NOT NULL AND m.score_b IS NOT NULL
+-                  {region_filter}
+-
+-                UNION ALL
+-
+-                SELECT t.id AS team_id, t.name AS team_name,
+-                       t.region, t.logo_url, t.country,
+-                       CASE WHEN m.score_b > m.score_a THEN 1 ELSE 0 END AS won
+-                FROM matches m
+-                JOIN teams t ON t.id = m.team_b_id
+-                WHERE m.match_datetime >= NOW() - (:days || ' days')::interval
+-                  AND m.score_a IS NOT NULL AND m.score_b IS NOT NULL
+-                  {region_filter}
+-            )
+-            SELECT team_id, team_name,
+-                   MAX(region) AS region,
+-                   MAX(logo_url) AS logo_url,
+-                   MAX(country) AS country,
+-                   COUNT(*) AS played,
+-                   SUM(won) AS wins,
+-                   ROUND(100.0 * SUM(won) / NULLIF(COUNT(*), 0), 1) AS win_pct
+-            FROM team_results
+-            GROUP BY team_id, team_name
+-            HAVING COUNT(*) >= :min_matches
+-            ORDER BY win_pct DESC, played DESC
++            SELECT t.id, t.name, t.region, t.logo_url, t.country,
++                   t.vlr_rating, t.vlr_rank, t.vlr_record
++            FROM teams t
++            WHERE t.vlr_rating IS NOT NULL {region_filter}
++            ORDER BY t.vlr_rating DESC NULLS LAST, t.vlr_rank ASC NULLS LAST
+             LIMIT :limit
+         """), params).all()
+ 
+@@ -270,20 +218,24 @@ async def regional_teams_leaderboard(
+                 "image_url": img, "country": country,
+             })
+ 
+-        return [
+-            {
++        out = []
++        for r in team_rows:
++            wins, losses = _wl_from_record(r[7])
++            played = wins + losses
++            out.append({
+                 "id": int(r[0]),
+                 "name": r[1],
+                 "region": r[2],
+                 "logo_url": r[3],
+                 "country": r[4],
+-                "matches_played": int(r[5]),
+-                "wins": int(r[6]),
+-                "losses": int(r[5]) - int(r[6]),
+-                "win_pct": float(r[7]) if r[7] is not None else 0.0,
++                "vlr_rating": int(r[5]) if r[5] is not None else None,
++                "vlr_rank": int(r[6]) if r[6] is not None else None,
++                "matches_played": played,
++                "wins": wins,
++                "losses": losses,
++                "win_pct": round(100.0 * wins / played, 1) if played else 0.0,
+                 "roster": rosters.get(int(r[0]), []),
+-            }
+-            for r in team_rows
+-        ]
++            })
++        return out
+     finally:
+         session.close()
+diff --git a/src/vlr/api/scheduler.py b/src/vlr/api/scheduler.py
+index 28c2e7d..7cb2ac3 100644
+--- a/src/vlr/api/scheduler.py
++++ b/src/vlr/api/scheduler.py
+@@ -1,93 +1,100 @@
+-"""Background scheduler — re-scrapes vlr.gg on an interval to keep the
+-'live results' actually live, plus an on-demand refresh used by the UI's
+-"Refresh now" button.
++"""Background scheduler — runs a full data-refresh cycle on an interval, and
++lets the UI trigger the same refresh on demand.
+ 
+-Implementation note: uses apscheduler's AsyncIOScheduler. The scrape runs
+-in a background thread so it doesn't block the API. If scraping fails
+-(network issue, vlr.gg rate-limiting us), the error is logged and the
+-next tick proceeds normally.
++The refresh (see pipeline.run_full_refresh) is fully incremental: new matches
++skip ones already stored, profile/logo backfills skip already-populated rows,
++and rankings/tiers just overwrite with fresh values. So re-running only does
++work for new/changed data.
++
++A refresh is guarded by a `_running` flag: if one is already in progress (from
++the timer or a manual click), another trigger is skipped rather than run twice.
+ 
+ Config via environment:
+   LIVE_SCRAPE_ENABLED       "true"/"false"  (default true)
+-  LIVE_SCRAPE_INTERVAL_MIN  minutes between scrapes (default 120 = 2h)
+-  LIVE_SCRAPE_PAGES         results pages to scrape per tick (default 1)
++  LIVE_SCRAPE_INTERVAL_MIN  minutes between refreshes (default 120 = 2h)
++  LIVE_SCRAPE_PAGES         results pages scraped per refresh (default 1)
+ """
+ from __future__ import annotations
+ 
+ import logging
+ import os
++import threading
+ from datetime import datetime
+-from threading import Lock
+ from typing import Optional
+ 
+ from apscheduler.schedulers.asyncio import AsyncIOScheduler
+ 
+ log = logging.getLogger(__name__)
+ 
+-
+-# Interval in minutes between scrapes. Default 2h; configurable via env.
+-_INTERVAL_MIN = int(os.environ.get("LIVE_SCRAPE_INTERVAL_MIN", "120"))
++_INTERVAL_MIN = int(os.environ.get("LIVE_SCRAPE_INTERVAL_MIN", "120"))  # 2 hours
+ _PAGES = int(os.environ.get("LIVE_SCRAPE_PAGES", "1"))
+ _ENABLED = os.environ.get("LIVE_SCRAPE_ENABLED", "true").lower() == "true"
+ 
+ scheduler: Optional[AsyncIOScheduler] = None
+ 
+-# --- Run state (exposed via /live/status) --------------------------------
+-_lock = Lock()
++# --- Run state -----------------------------------------------------------
++_lock = threading.Lock()
++_running = False
+ _last_run_at: Optional[datetime] = None
+-_last_inserted: Optional[int] = None
+-_last_status: str = "never"  # "never" | "running" | "ok" | "error"
++_last_result: Optional[dict] = None
++_last_status = "never"  # never | running | ok | error
+ 
+ 
+-def _do_scrape() -> int:
+-    """Run one scrape pass. Returns count of newly-inserted matches.
+-
+-    Updates the module-level run state so /live/status can report it.
+-    Never raises — errors are captured into the status.
+-    """
+-    global _last_run_at, _last_inserted, _last_status
++def _do_full_refresh() -> dict:
++    """Run one full refresh. Guarded so it never runs twice concurrently."""
++    global _running, _last_run_at, _last_result, _last_status
+     with _lock:
++        if _running:
++            log.info("[refresh] already running — skipping this trigger")
++            return {"status": "already_running"}
++        _running = True
+         _last_status = "running"
+-    log.info("[live-scrape] tick at %s", datetime.utcnow().isoformat())
++
++    log.info("[refresh] full refresh started at %s", datetime.utcnow().isoformat())
+     try:
+-        from ..scraping.pipeline import scrape_recent_results
+-        n = scrape_recent_results(pages=_PAGES)
++        from ..scraping.pipeline import run_full_refresh
++        result = run_full_refresh(pages=_PAGES)
+         with _lock:
+             _last_run_at = datetime.utcnow()
+-            _last_inserted = n
++            _last_result = result
+             _last_status = "ok"
+-        log.info("[live-scrape] %d new match(es) inserted", n)
+-        return n
++        log.info("[refresh] done: %s", result)
++        return result
+     except Exception:
+         with _lock:
+             _last_run_at = datetime.utcnow()
+             _last_status = "error"
+-        log.exception("[live-scrape] failed")
+-        return 0
++        log.exception("[refresh] failed")
++        return {"status": "error"}
++    finally:
++        with _lock:
++            _running = False
+ 
+ 
+-def _run_scrape() -> None:
+-    """Scheduled-tick entrypoint (respects the enabled flag)."""
++def _run_scheduled() -> None:
++    """Timer entrypoint (respects the enabled flag)."""
+     if not _ENABLED:
+         return
+-    _do_scrape()
++    _do_full_refresh()
+ 
+ 
+ def run_now() -> dict:
+-    """Trigger an immediate scrape (used by the manual refresh endpoint).
++    """Kick off a full refresh in the background and return immediately.
+ 
+-    Runs synchronously in the calling thread and returns a small result dict.
+-    Safe to call regardless of whether the scheduler is enabled.
++    If a refresh is already running (timer or a previous click), this is a
++    no-op that reports so — the in-flight run will finish the work.
+     """
+-    n = _do_scrape()
+-    return {"inserted": n, "ran_at": _last_run_at.isoformat() if _last_run_at else None}
++    with _lock:
++        if _running:
++            return {"status": "already_running", "started": False}
++    threading.Thread(target=_do_full_refresh, name="vlr-full-refresh", daemon=True).start()
++    return {"status": "started", "started": True}
+ 
+ 
+ def get_status() -> dict:
+-    """Snapshot of the live-scrape state for the /live/status endpoint."""
+     next_run: Optional[str] = None
+     if scheduler is not None:
+-        job = scheduler.get_job("live_scrape")
++        job = scheduler.get_job("full_refresh")
+         if job is not None and job.next_run_time is not None:
+             next_run = job.next_run_time.isoformat()
+     with _lock:
+@@ -95,8 +102,9 @@ def get_status() -> dict:
+             "enabled": _ENABLED,
+             "interval_minutes": _INTERVAL_MIN,
+             "status": _last_status,
++            "running": _running,
+             "last_run": _last_run_at.isoformat() if _last_run_at else None,
+-            "last_inserted": _last_inserted,
++            "last_result": _last_result,
+             "next_run": next_run,
+         }
+ 
+@@ -105,22 +113,22 @@ def start_scheduler() -> None:
+     """Idempotent — safe to call multiple times."""
+     global scheduler
+     if not _ENABLED:
+-        log.info("[live-scrape] disabled via LIVE_SCRAPE_ENABLED=false")
++        log.info("[refresh] disabled via LIVE_SCRAPE_ENABLED=false")
+         return
+     if scheduler is not None:
+         return
+     scheduler = AsyncIOScheduler()
+     scheduler.add_job(
+-        _run_scrape,
++        _run_scheduled,
+         "interval",
+         minutes=_INTERVAL_MIN,
+         next_run_time=datetime.utcnow(),  # run once immediately on startup
+-        id="live_scrape",
++        id="full_refresh",
+         coalesce=True,
+         max_instances=1,
+     )
+     scheduler.start()
+-    log.info("[live-scrape] scheduler started, interval=%d min", _INTERVAL_MIN)
++    log.info("[refresh] scheduler started, interval=%d min", _INTERVAL_MIN)
+ 
+ 
+ def stop_scheduler() -> None:
+@@ -128,4 +136,4 @@ def stop_scheduler() -> None:
+     if scheduler is not None:
+         scheduler.shutdown(wait=False)
+         scheduler = None
+-        log.info("[live-scrape] scheduler stopped")
++        log.info("[refresh] scheduler stopped")
+diff --git a/src/vlr/api/schemas.py b/src/vlr/api/schemas.py
+index 2079c2e..1b79488 100644
+--- a/src/vlr/api/schemas.py
++++ b/src/vlr/api/schemas.py
+@@ -191,14 +191,15 @@ class LiveStatus(BaseModel):
+     enabled: bool
+     interval_minutes: int
+     status: str
++    running: bool = False
+     last_run: Optional[str] = None
+-    last_inserted: Optional[int] = None
++    last_result: Optional[dict] = None
+     next_run: Optional[str] = None
+ 
+ 
+ class RefreshResult(BaseModel):
+-    inserted: int
+-    ran_at: Optional[str] = None
++    status: str
++    started: bool = False
+ 
+ 
+ # --- Pick'em / event forecast --------------------------------------------
+diff --git a/src/vlr/cli.py b/src/vlr/cli.py
+index 0dc5fc1..0d78d3d 100644
+--- a/src/vlr/cli.py
++++ b/src/vlr/cli.py
+@@ -38,6 +38,7 @@ from .scraping.pipeline import (
+     repair_event_names,
+     scrape_event,
+     scrape_match_ids,
++    scrape_rankings,
+     scrape_recent,
+ )
+ 
+@@ -148,6 +149,20 @@ def scrape_matches_cmd(
+ # --- Discovery -----------------------------------------------------------
+ 
+ 
++@app.command("scrape-rankings")
++def scrape_rankings_cmd(
++    verbose: bool = typer.Option(False, "--verbose", "-v"),
++) -> None:
++    """Scrape vlr.gg official team rankings (rating / rank / record) into the
++    teams table, across all franchise regions."""
++    _configure_logging(verbose)
++    stats = scrape_rankings()
++    console.print(
++        f"\n[bold]Rankings done.[/bold] regions={stats['regions']} "
++        f"teams={stats['teams']} created={stats['created']} failed={stats['failed']}"
++    )
++
++
+ @app.command("discover-events")
+ def discover_events_cmd(
+     search: Optional[str] = typer.Option(None, "--search", "-s"),
+diff --git a/src/vlr/db/models.py b/src/vlr/db/models.py
+index ed2cdd2..f80b82d 100644
+--- a/src/vlr/db/models.py
++++ b/src/vlr/db/models.py
+@@ -35,6 +35,10 @@ class Team(Base):
+     region: Mapped[Optional[str]] = mapped_column(String(64))
+     logo_url: Mapped[Optional[str]] = mapped_column(String(512))
+     country: Mapped[Optional[str]] = mapped_column(String(64))
++    # Official vlr.gg ranking (from /rankings) — rating, rank-in-region, W-L.
++    vlr_rating: Mapped[Optional[int]] = mapped_column(Integer)
++    vlr_rank: Mapped[Optional[int]] = mapped_column(Integer)
++    vlr_record: Mapped[Optional[str]] = mapped_column(String(32))
+     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
+ 
+ 
+diff --git a/src/vlr/db/session.py b/src/vlr/db/session.py
+index 90c7a45..bda1c7e 100644
+--- a/src/vlr/db/session.py
++++ b/src/vlr/db/session.py
+@@ -39,6 +39,13 @@ _MIGRATIONS: list[tuple[str, str]] = [
+      "ALTER TABLE teams ADD COLUMN IF NOT EXISTS logo_url VARCHAR(512)"),
+     ("add_teams_country",
+      "ALTER TABLE teams ADD COLUMN IF NOT EXISTS country VARCHAR(64)"),
++    # Official vlr.gg rankings (rating / rank / record)
++    ("add_teams_vlr_rating",
++     "ALTER TABLE teams ADD COLUMN IF NOT EXISTS vlr_rating INTEGER"),
++    ("add_teams_vlr_rank",
++     "ALTER TABLE teams ADD COLUMN IF NOT EXISTS vlr_rank INTEGER"),
++    ("add_teams_vlr_record",
++     "ALTER TABLE teams ADD COLUMN IF NOT EXISTS vlr_record VARCHAR(32)"),
+ ]
+ 
+ 
+diff --git a/src/vlr/regions.py b/src/vlr/regions.py
+new file mode 100644
+index 0000000..8b1f744
+--- /dev/null
++++ b/src/vlr/regions.py
+@@ -0,0 +1,31 @@
++"""Canonical vlr.gg rankings regions — the single source of truth.
++
++vlr.gg/rankings exposes one page per region (``/rankings/<slug>``). We scrape
++each one and store its slug directly on the team, so every regional view in the
++app mirrors vlr.gg exactly instead of collapsing everything into a handful of
++franchise buckets.
++
++Order matches vlr's own region selector.
++"""
++from __future__ import annotations
++
++# (slug, display label, short code) in vlr's display order.
++VLR_REGIONS: list[tuple[str, str, str]] = [
++    ("north-america", "North America", "NA"),
++    ("europe", "Europe", "EU"),
++    ("brazil", "Brazil", "BR"),
++    ("asia-pacific", "Asia-Pacific", "AP"),
++    ("korea", "Korea", "KR"),
++    ("china", "China", "CN"),
++    ("japan", "Japan", "JP"),
++    ("la-s", "LA-S", "LAS"),
++    ("la-n", "LA-N", "LAN"),
++    ("oceania", "Oceania", "OCE"),
++    ("mena", "MENA", "MN"),
++    ("gc", "Game Changers", "GC"),
++    ("collegiate", "Collegiate", "CG"),
++]
++
++# Slugs in scrape / display order.
++VLR_REGION_SLUGS: list[str] = [slug for slug, _label, _short in VLR_REGIONS]
++VLR_REGION_SET: frozenset[str] = frozenset(VLR_REGION_SLUGS)
+diff --git a/src/vlr/scraping/parsers.py b/src/vlr/scraping/parsers.py
+index c4631e6..67fd2b2 100644
+--- a/src/vlr/scraping/parsers.py
++++ b/src/vlr/scraping/parsers.py
+@@ -1035,3 +1035,67 @@ def parse_team_profile(html: str, team_id: int) -> TeamProfile:
+         profile.name = name_el.get_text(strip=True) or None
+ 
+     return profile
++
++
++# --- Rankings parser (vlr.gg official team rankings) -----------------------
++# https://www.vlr.gg/rankings/<region> — rank, team, vlr rating, record.
++
++
++@dataclass
++class RankedTeam:
++    team_id: int
++    name: str
++    rank: Optional[int] = None
++    rating: Optional[int] = None
++    country: Optional[str] = None
++    record: Optional[str] = None
++
++
++def parse_rankings(html: str) -> list[RankedTeam]:
++    """Parse a vlr.gg /rankings/<region> page into ranked teams.
++
++    Each `.rank-item` carries the rank (`.rank-item-rank-num`), the team
++    (`a.rank-item-team` → id + `data-sort-value` name + `.rank-item-team-country`),
++    vlr's rating (`.rank-item-rating[data-sort-value]`), and W-L record
++    (`.rank-item-record`).
++    """
++    soup = BeautifulSoup(html, "lxml")
++    out: list[RankedTeam] = []
++    for item in soup.select(".rank-item"):
++        a = item.select_one("a.rank-item-team")
++        if a is None:
++            continue
++        m = TEAM_URL_RE.match(a.get("href", ""))
++        if not m:
++            continue
++        team_id = int(m.group(1))
++
++        name = a.get("data-sort-value") or ""
++        if not name:
++            img = a.select_one("img")
++            name = (img.get("alt") if img else "") or ""
++        name = _strip(name) or ""
++        if not name:
++            continue
++
++        rank_el = item.select_one(".rank-item-rank-num")
++        rank = _int_or_none(_strip(rank_el.get_text())) if rank_el else None
++
++        rating = None
++        rating_el = item.select_one(".rank-item-rating[data-sort-value]")
++        if rating_el is not None:
++            rating = _int_or_none(rating_el.get("data-sort-value"))
++            if rating is None:
++                rating = _int_or_none(_first_token(rating_el.get_text()))
++
++        country_el = item.select_one(".rank-item-team-country")
++        country = _strip(country_el.get_text()) if country_el else None
++
++        record_el = item.select_one(".rank-item-record")
++        record = _strip(record_el.get_text()) if record_el else None
++
++        out.append(RankedTeam(
++            team_id=team_id, name=name, rank=rank,
++            rating=rating, country=country, record=record,
++        ))
++    return out
+diff --git a/src/vlr/scraping/pipeline.py b/src/vlr/scraping/pipeline.py
+index dc47d06..fd5beca 100644
+--- a/src/vlr/scraping/pipeline.py
++++ b/src/vlr/scraping/pipeline.py
+@@ -10,6 +10,7 @@ from sqlalchemy import select
+ from sqlalchemy.orm import Session
+ 
+ from ..config import settings
++from ..regions import VLR_REGION_SLUGS
+ from ..db.models import (
+     Event,
+     MapPlayed,
+@@ -26,8 +27,10 @@ from .parsers import (
+     MatchDetail,
+     MatchListing,
+     PlayerStat,
++    RankedTeam,
+     parse_events_listing,
+     parse_match_detail,
++    parse_rankings,
+     parse_results_listing,
+ )
+ 
+@@ -455,6 +458,73 @@ def scrape_match_ids(match_ids: Iterable[int], force: bool = True) -> dict[str,
+     return _scrape_listings(listings, f"{len(listings)} explicit match id(s)", force=force)
+ 
+ 
++# --- Official vlr.gg rankings --------------------------------------------
++# vlr ranks teams per region (see vlr.regions.VLR_REGION_SLUGS). We store each
++# team's vlr region slug directly, so the app's regional views mirror vlr.gg
++# exactly. If a team ever appears in more than one vlr region, the one scraped
++# LAST wins.
++
++
++def fetch_rankings_page(region_slug: str) -> str:
++    return fetch(f"{settings.vlr_base_url}/rankings/{region_slug}")
++
++
++def scrape_rankings(regions: Optional[list[str]] = None) -> dict[str, int]:
++    """Scrape vlr.gg official team rankings and store rating / rank / record +
++    the team's vlr region on each team. Safe to re-run (only updates the ranking
++    columns; creates a team row only if it's brand new)."""
++    slugs = regions or VLR_REGION_SLUGS
++    stats = {"regions": 0, "teams": 0, "created": 0, "failed": 0}
++    session = get_session()
++    # team_id -> Team object, kept across regions. vlr lists some teams more
++    # than once (within and across region pages); this ensures we never add the
++    # same primary key twice (autoflush is off, so session.get won't return a
++    # pending, not-yet-committed add).
++    cache: dict[int, Team] = {}
++    try:
++        for slug in slugs:
++            try:
++                ranked: list[RankedTeam] = parse_rankings(fetch_rankings_page(slug))
++            except HttpError as exc:
++                log.warning("Rankings fetch failed for %s: %s", slug, exc)
++                stats["failed"] += 1
++                continue
++            except Exception:
++                log.exception("Rankings parse failed for %s", slug)
++                stats["failed"] += 1
++                continue
++
++            for rt in ranked:
++                team = cache.get(rt.team_id)
++                if team is None:
++                    team = session.get(Team, rt.team_id)
++                if team is None:
++                    team = Team(id=rt.team_id, name=rt.name)
++                    session.add(team)
++                    stats["created"] += 1
++                cache[rt.team_id] = team
++                if rt.name:
++                    team.name = rt.name
++                team.vlr_rating = rt.rating
++                team.vlr_rank = rt.rank
++                team.vlr_record = rt.record
++                team.region = slug  # the team's vlr region
++                stats["teams"] += 1
++            try:
++                session.commit()
++            except Exception:
++                session.rollback()
++                cache.clear()
++                log.exception("Rankings commit failed for %s", slug)
++                stats["failed"] += 1
++                continue
++            stats["regions"] += 1
++            log.info("Rankings %s: %d teams", slug, len(ranked))
++    finally:
++        session.close()
++    return stats
++
++
+ # --- Bulk event scraping with resumability -------------------------------
+ 
+ 
+@@ -789,3 +859,76 @@ def backfill_team_logos(
+             on_progress(i, total, tid, status)
+ 
+     return counts
++
++
++# --- Full refresh cycle ---------------------------------------------------
++# One call that keeps everything aligned with vlr. Every step is incremental:
++# matches skip ones already in the DB; profile/logo backfills skip rows that are
++# already populated; rankings + tier classification just overwrite with fresh
++# values (cheap). So re-running only does work for NEW / changed data.
++
++
++def _classify_event_tiers() -> int:
++    """(Re)classify every event's tier from its name. Cheap, no network."""
++    from ..ml.tiers import classify_event_tier
++    session = get_session()
++    try:
++        events = session.execute(select(Event)).scalars().all()
++        changed = 0
++        for ev in events:
++            tier = classify_event_tier(ev.name)
++            if ev.tier != tier:
++                ev.tier = tier
++                changed += 1
++        session.commit()
++        return changed
++    finally:
++        session.close()
++
++
++# How many player photos / team logos to top up per refresh. Bounded so a single
++# refresh can't run for hours at ~2s/request — it just keeps chipping at the
++# trickle of NEW players/teams. Clear a big historical backlog once, by hand,
++# with `python -m vlr.cli backfill-player-profiles` (no limit).
++REFRESH_PROFILE_LIMIT = 80
++REFRESH_LOGO_LIMIT = 50
++
++
++def run_full_refresh(pages: int = 1) -> dict:
++    """Full data-refresh: new matches + vlr rankings + new player photos +
++    new team logos + event tiers. Each step is incremental (see note above).
++    The photo/logo top-ups are capped per run so this never runs for hours."""
++    result: dict = {}
++
++    try:
++        result["new_matches"] = scrape_recent_results(pages=pages)
++    except Exception:
++        log.exception("full-refresh: recent matches failed")
++        result["new_matches"] = 0
++
++    try:
++        result["rankings"] = scrape_rankings()
++    except Exception:
++        log.exception("full-refresh: rankings failed")
++        result["rankings"] = {}
++
++    try:
++        result["player_profiles"] = backfill_player_profiles(limit=REFRESH_PROFILE_LIMIT)
++    except Exception:
++        log.exception("full-refresh: player profiles failed")
++        result["player_profiles"] = {}
++
++    try:
++        result["team_logos"] = backfill_team_logos(limit=REFRESH_LOGO_LIMIT)
++    except Exception:
++        log.exception("full-refresh: team logos failed")
++        result["team_logos"] = {}
++
++    try:
++        result["events_reclassified"] = _classify_event_tiers()
++    except Exception:
++        log.exception("full-refresh: tier classify failed")
++        result["events_reclassified"] = 0
++
++    log.info("full-refresh complete: %s", result)
++    return result
+diff --git a/web/app/players/page.tsx b/web/app/players/page.tsx
+index c4ae817..9610ad3 100644
+--- a/web/app/players/page.tsx
++++ b/web/app/players/page.tsx
+@@ -18,18 +18,12 @@ import { StatTile } from '@/components/ui/stat-tile';
+ import { PlayerAvatar, TeamLogo } from '@/components/ui/avatar';
+ import { Skeleton } from '@/components/ui/skeleton';
+ import { cn, countryFlag } from '@/lib/utils';
++import { VLR_REGIONS } from '@/lib/regions';
+ 
+-type Region = 'americas' | 'emea' | 'pacific' | 'china';
+-
+-const REGIONS: { value: Region; label: string }[] = [
+-  { value: 'americas', label: 'Americas' },
+-  { value: 'emea', label: 'EMEA' },
+-  { value: 'pacific', label: 'Pacific' },
+-  { value: 'china', label: 'China' },
+-];
++const REGIONS = VLR_REGIONS.map((r) => ({ value: r.slug, label: r.label }));
+ 
+ export default function PlayersPage() {
+-  const [region, setRegion] = useState<Region>('americas');
++  const [region, setRegion] = useState<string>('north-america');
+   const [topTeams, setTopTeams] = useState<RegionalTeam[]>([]);
+   const [selectedTeam, setSelectedTeam] = useState<RegionalTeam | null>(null);
+   const [roster, setRoster] = useState<TeamRosterPlayer[]>([]);
+@@ -104,8 +98,8 @@ export default function PlayersPage() {
+           Browse rosters by region.
+         </h1>
+         <p className="mt-4 text-base text-ink-soft max-w-2xl">
+-          Top 5 teams in each region by recent win rate. Click a team to see its
+-          current roster. Click a player to dive into their stats.
++          Top 5 teams in each vlr.gg region by official rating. Click a team to
++          see its current roster. Click a player to dive into their stats.
+         </p>
+       </motion.div>
+ 
+@@ -114,7 +108,7 @@ export default function PlayersPage() {
+         initial={{ opacity: 0 }}
+         animate={{ opacity: 1 }}
+         transition={{ delay: 0.15 }}
+-        className="mt-10 flex gap-1 p-1 bg-surface border border-border rounded-xl w-fit"
++        className="mt-10 flex flex-wrap gap-1 p-1 bg-surface border border-border rounded-xl"
+       >
+         {REGIONS.map((r) => (
+           <button
+@@ -135,7 +129,7 @@ export default function PlayersPage() {
+       {/* Top teams grid */}
+       <div className="mt-6">
+         <div className="text-[0.7rem] font-medium uppercase tracking-widest text-ink-dim mb-3">
+-          Top 5 in {REGIONS.find((r) => r.value === region)?.label} · last 120 days
++          Top 5 in {REGIONS.find((r) => r.value === region)?.label} · by vlr.gg rating
+         </div>
+         {topTeams.length === 0 ? (
+           <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
+@@ -172,8 +166,8 @@ export default function PlayersPage() {
+                         <div className="text-[0.65rem] font-mono uppercase tracking-widest text-ink-dim">
+                           #{i + 1}
+                         </div>
+-                        <div className="font-mono text-xs text-ink-soft tabular">
+-                          {t.win_pct.toFixed(0)}%
++                        <div className="font-mono text-xs text-ink-soft tabular" title="vlr.gg rating">
++                          {t.vlr_rating ?? '—'}
+                         </div>
+                       </div>
+                       <div className="flex items-center gap-3 mb-2">
+diff --git a/web/app/teams/page.tsx b/web/app/teams/page.tsx
+index 039b358..dcf2ca5 100644
+--- a/web/app/teams/page.tsx
++++ b/web/app/teams/page.tsx
+@@ -7,19 +7,15 @@ import { api, type LeaderboardTeam } from '@/lib/api';
+ import { PlayerAvatar, TeamLogo } from '@/components/ui/avatar';
+ import { Skeleton } from '@/components/ui/skeleton';
+ import { cn, countryFlag } from '@/lib/utils';
++import { VLR_REGIONS, regionLabel } from '@/lib/regions';
+ 
+-type RegionFilter = 'all' | 'americas' | 'emea' | 'pacific' | 'china';
+-
+-const REGIONS: { value: RegionFilter; label: string }[] = [
++const REGIONS: { value: string; label: string }[] = [
+   { value: 'all', label: 'All Regions' },
+-  { value: 'americas', label: 'Americas' },
+-  { value: 'emea', label: 'EMEA' },
+-  { value: 'pacific', label: 'Pacific' },
+-  { value: 'china', label: 'China' },
++  ...VLR_REGIONS.map((r) => ({ value: r.slug, label: r.label })),
+ ];
+ 
+ export default function TeamsPage() {
+-  const [region, setRegion] = useState<RegionFilter>('all');
++  const [region, setRegion] = useState<string>('all');
+   const [teams, setTeams] = useState<LeaderboardTeam[]>([]);
+   const [loading, setLoading] = useState(true);
+   const [search, setSearch] = useState('');
+@@ -56,8 +52,8 @@ export default function TeamsPage() {
+           Valorant world rankings.
+         </h1>
+         <p className="mt-4 text-base text-ink-soft max-w-2xl">
+-          Teams ranked by match win rate over the last 180 days. Minimum 5
+-          decided matches required to appear on the leaderboard.
++          Teams ranked by their official vlr.gg rating. Only teams that appear
++          in vlr's regional rankings are listed.
+         </p>
+       </motion.div>
+ 
+@@ -68,7 +64,7 @@ export default function TeamsPage() {
+         transition={{ delay: 0.15 }}
+         className="mt-10 flex flex-wrap items-center justify-between gap-4"
+       >
+-        <div className="flex gap-1 p-1 bg-surface border border-border rounded-xl w-fit">
++        <div className="flex flex-wrap gap-1 p-1 bg-surface border border-border rounded-xl">
+           {REGIONS.map((r) => (
+             <button
+               key={r.value}
+@@ -115,7 +111,7 @@ export default function TeamsPage() {
+             Region
+           </div>
+           <div className="text-[0.65rem] font-medium uppercase tracking-widest text-ink-dim">
+-            Record
++            Rating
+           </div>
+           <div className="text-[0.65rem] font-medium uppercase tracking-widest text-ink-dim">
+             Roster
+@@ -209,20 +205,20 @@ export default function TeamsPage() {
+                         )}
+                       </div>
+                       <div className="text-[0.7rem] text-ink-dim md:hidden mt-0.5">
+-                        {team.region || '—'} · {team.wins}W-{team.losses}L
++                        {regionLabel(team.region)} · {team.wins}W-{team.losses}L
+                       </div>
+                     </div>
+                   </div>
+ 
+                   {/* Region (md+) */}
+-                  <div className="hidden md:block text-sm text-ink-soft capitalize">
+-                    {team.region || '—'}
++                  <div className="hidden md:block text-sm text-ink-soft">
++                    {regionLabel(team.region)}
+                   </div>
+ 
+-                  {/* Record + win% (md+) */}
++                  {/* vlr rating + record (md+) */}
+                   <div className="hidden md:flex items-baseline gap-2">
+                     <div className="font-mono font-semibold text-ink tabular">
+-                      {team.win_pct.toFixed(0)}%
++                      {team.vlr_rating ?? '—'}
+                     </div>
+                     <div className="text-xs text-ink-dim font-mono tabular">
+                       {team.wins}–{team.losses}
+diff --git a/web/components/ui/live-refresh.tsx b/web/components/ui/live-refresh.tsx
+index d0bcbc3..56ba324 100644
+--- a/web/components/ui/live-refresh.tsx
++++ b/web/components/ui/live-refresh.tsx
+@@ -1,6 +1,6 @@
+ 'use client';
+ 
+-import { useCallback, useEffect, useState } from 'react';
++import { useCallback, useEffect, useRef, useState } from 'react';
+ import { RefreshCw } from 'lucide-react';
+ import { api, type LiveStatus } from '@/lib/api';
+ import { cn } from '@/lib/utils';
+@@ -19,53 +19,77 @@ function timeAgo(iso: string | null): string {
+ }
+ 
+ /**
+- * Subtle pill that shows when data was last refreshed and lets the user pull
+- * live data on demand (calls POST /live/refresh). Fails soft when the API is
+- * unreachable — it just shows "Refresh data".
++ * Subtle pill that shows when data was last refreshed and triggers a full
++ * vlr refresh on demand (matches + rankings + new-player/team profiles + tiers).
++ * The refresh runs in the background; the pill polls status while it's running.
++ * Fails soft when the API is unreachable.
+  */
+ export function LiveRefresh({ className }: { className?: string }) {
+   const [status, setStatus] = useState<LiveStatus | null>(null);
+   const [busy, setBusy] = useState(false);
++  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+ 
+-  const load = useCallback(() => {
+-    api.liveStatus().then(setStatus).catch(() => {});
++  const load = useCallback(async (): Promise<LiveStatus | null> => {
++    try {
++      const s = await api.liveStatus();
++      setStatus(s);
++      return s;
++    } catch {
++      return null;
++    }
+   }, []);
+ 
+   useEffect(() => {
+     load();
++    return () => {
++      if (pollRef.current) clearInterval(pollRef.current);
++    };
+   }, [load]);
+ 
++  function startPolling() {
++    if (pollRef.current) clearInterval(pollRef.current);
++    pollRef.current = setInterval(async () => {
++      const s = await load();
++      if (!s || !s.running) {
++        if (pollRef.current) clearInterval(pollRef.current);
++        pollRef.current = null;
++        setBusy(false);
++      }
++    }, 5000);
++  }
++
+   async function refresh() {
+-    if (busy) return;
++    if (busy || status?.running) return;
+     setBusy(true);
+     try {
+       await api.refresh();
+-      load();
++      await load();
++      startPolling();
+     } catch {
+-      /* ignore — offline */
+-    } finally {
+       setBusy(false);
+     }
+   }
+ 
++  const running = busy || !!status?.running;
++
+   return (
+     <button
+       onClick={refresh}
+-      disabled={busy}
+-      title="Refresh live data now"
++      disabled={running}
++      title="Refresh all data from vlr.gg now"
+       className={cn(
+-        'group inline-flex items-center gap-1.5 px-3 py-1 bg-surface border border-border rounded-full text-xs text-ink-soft hover:text-ink hover:border-border-strong transition-colors disabled:opacity-60',
++        'group inline-flex items-center gap-1.5 px-3 py-1 bg-surface border border-border rounded-full text-xs text-ink-soft hover:text-ink hover:border-border-strong transition-colors disabled:opacity-70',
+         className,
+       )}
+     >
+       <RefreshCw
+         className={cn(
+           'w-3 h-3 text-ink-dim group-hover:text-accent transition-colors',
+-          busy && 'animate-spin',
++          running && 'animate-spin',
+         )}
+       />
+       <span>
+-        {busy ? 'Refreshing…' : status?.last_run ? `Updated ${timeAgo(status.last_run)}` : 'Refresh data'}
++        {running ? 'Refreshing…' : status?.last_run ? `Updated ${timeAgo(status.last_run)}` : 'Refresh data'}
+       </span>
+     </button>
+   );
+diff --git a/web/lib/api.ts b/web/lib/api.ts
+index f4702d3..f7e404e 100644
+--- a/web/lib/api.ts
++++ b/web/lib/api.ts
+@@ -185,14 +185,15 @@ export interface LiveStatus {
+   enabled: boolean;
+   interval_minutes: number;
+   status: string;
++  running: boolean;
+   last_run: string | null;
+-  last_inserted: number | null;
++  last_result: Record<string, unknown> | null;
+   next_run: string | null;
+ }
+ 
+ export interface RefreshResult {
+-  inserted: number;
+-  ran_at: string | null;
++  status: string;
++  started: boolean;
+ }
+ 
+ export interface EventTeam {
+@@ -285,6 +286,8 @@ export interface RegionalTeam {
+   wins: number;
+   losses: number;
+   win_pct: number;
++  vlr_rating?: number | null;
++  vlr_rank?: number | null;
+ }
+ 
+ export interface TeamRosterPlayer {
+diff --git a/web/lib/mock-data.ts b/web/lib/mock-data.ts
+index 2b3ff10..c868141 100644
+--- a/web/lib/mock-data.ts
++++ b/web/lib/mock-data.ts
+@@ -16,14 +16,14 @@ const r2 = (n: number) => Math.round(n * 100) / 100;
+ 
+ // --- Teams ---------------------------------------------------------------
+ const TEAM_DEFS = [
+-  { id: 8001, name: 'Sentinels', region: 'americas', country: 'us' },
+-  { id: 8002, name: 'LOUD', region: 'americas', country: 'br' },
+-  { id: 8003, name: 'Fnatic', region: 'emea', country: 'gb' },
+-  { id: 8004, name: 'Paper Rex', region: 'pacific', country: 'sg' },
+-  { id: 8005, name: 'DRX', region: 'pacific', country: 'kr' },
+-  { id: 8006, name: 'Team Heretics', region: 'emea', country: 'es' },
++  { id: 8001, name: 'Sentinels', region: 'north-america', country: 'us' },
++  { id: 8002, name: 'LOUD', region: 'brazil', country: 'br' },
++  { id: 8003, name: 'Fnatic', region: 'europe', country: 'gb' },
++  { id: 8004, name: 'Paper Rex', region: 'asia-pacific', country: 'sg' },
++  { id: 8005, name: 'DRX', region: 'korea', country: 'kr' },
++  { id: 8006, name: 'Team Heretics', region: 'europe', country: 'es' },
+   { id: 8007, name: 'EDward Gaming', region: 'china', country: 'cn' },
+-  { id: 8008, name: 'G2 Esports', region: 'americas', country: 'us' },
++  { id: 8008, name: 'G2 Esports', region: 'north-america', country: 'us' },
+ ];
+ 
+ const ROSTERS: Record<number, string[]> = {
+@@ -254,6 +254,8 @@ function leaderboardTeam(id: number, rank: number) {
+     logo_url: null,
+     country: t.country,
+     region: t.region,
++    vlr_rating: 2000 - rank * 32,
++    vlr_rank: rank + 1,
+     matches_played: wins + losses,
+     wins,
+     losses,
+@@ -405,7 +407,7 @@ export function resolveMock(rawPath: string, init?: RequestInit): any {
+       : TEAM_DEFS;
+     return ranked.slice(0, 5).map((t, i) => {
+       const lb = leaderboardTeam(t.id, i);
+-      return { id: lb.id, name: lb.name, logo_url: null, country: lb.country, matches_played: lb.matches_played, wins: lb.wins, losses: lb.losses, win_pct: lb.win_pct };
++      return { id: lb.id, name: lb.name, logo_url: null, country: lb.country, vlr_rating: lb.vlr_rating, vlr_rank: lb.vlr_rank, matches_played: lb.matches_played, wins: lb.wins, losses: lb.losses, win_pct: lb.win_pct };
+     });
+   }
+   if (seg[0] === 'regions' && seg[2] === 'teams-leaderboard') {
+@@ -514,10 +516,10 @@ export function resolveMock(rawPath: string, init?: RequestInit): any {
+ 
+   // live
+   if (path === '/live/status') {
+-    return { enabled: true, interval_minutes: 120, status: 'ok', last_run: MATCHES[MATCHES.length - 1].datetime, last_inserted: 3, next_run: null };
++    return { enabled: true, interval_minutes: 300, status: 'ok', running: false, last_run: MATCHES[MATCHES.length - 1].datetime, last_result: null, next_run: null };
+   }
+   if (path === '/live/refresh') {
+-    return { inserted: 0, ran_at: MATCHES[MATCHES.length - 1].datetime };
++    return { status: 'started', started: true };
+   }
+ 
+   return undefined;
+diff --git a/web/lib/regions.ts b/web/lib/regions.ts
+new file mode 100644
+index 0000000..64eedb6
+--- /dev/null
++++ b/web/lib/regions.ts
+@@ -0,0 +1,30 @@
++// vlr.gg's rankings regions — the single source of truth for the UI.
++// Mirrors src/vlr/regions.py so the app's regional views match vlr.gg exactly.
++
++export interface VlrRegion {
++  slug: string;
++  label: string;
++  short: string;
++}
++
++export const VLR_REGIONS: VlrRegion[] = [
++  { slug: 'north-america', label: 'North America', short: 'NA' },
++  { slug: 'europe', label: 'Europe', short: 'EU' },
++  { slug: 'brazil', label: 'Brazil', short: 'BR' },
++  { slug: 'asia-pacific', label: 'Asia-Pacific', short: 'AP' },
++  { slug: 'korea', label: 'Korea', short: 'KR' },
++  { slug: 'china', label: 'China', short: 'CN' },
++  { slug: 'japan', label: 'Japan', short: 'JP' },
++  { slug: 'la-s', label: 'LA-S', short: 'LAS' },
++  { slug: 'la-n', label: 'LA-N', short: 'LAN' },
++  { slug: 'oceania', label: 'Oceania', short: 'OCE' },
++  { slug: 'mena', label: 'MENA', short: 'MN' },
++  { slug: 'gc', label: 'Game Changers', short: 'GC' },
++  { slug: 'collegiate', label: 'Collegiate', short: 'CG' },
++];
++
++// Human label for a region slug (falls back to the slug itself).
++export function regionLabel(slug: string | null | undefined): string {
++  if (!slug) return '—';
++  return VLR_REGIONS.find((r) => r.slug === slug)?.label ?? slug;
++}

@@ -18,18 +18,12 @@ import { StatTile } from '@/components/ui/stat-tile';
 import { PlayerAvatar, TeamLogo } from '@/components/ui/avatar';
 import { Skeleton } from '@/components/ui/skeleton';
 import { cn, countryFlag } from '@/lib/utils';
+import { VLR_REGIONS } from '@/lib/regions';
 
-type Region = 'americas' | 'emea' | 'pacific' | 'china';
-
-const REGIONS: { value: Region; label: string }[] = [
-  { value: 'americas', label: 'Americas' },
-  { value: 'emea', label: 'EMEA' },
-  { value: 'pacific', label: 'Pacific' },
-  { value: 'china', label: 'China' },
-];
+const REGIONS = VLR_REGIONS.map((r) => ({ value: r.slug, label: r.label }));
 
 export default function PlayersPage() {
-  const [region, setRegion] = useState<Region>('americas');
+  const [region, setRegion] = useState<string>('north-america');
   const [topTeams, setTopTeams] = useState<RegionalTeam[]>([]);
   const [selectedTeam, setSelectedTeam] = useState<RegionalTeam | null>(null);
   const [roster, setRoster] = useState<TeamRosterPlayer[]>([]);
@@ -104,8 +98,8 @@ export default function PlayersPage() {
           Browse rosters by region.
         </h1>
         <p className="mt-4 text-base text-ink-soft max-w-2xl">
-          Top 5 teams in each region by recent win rate. Click a team to see its
-          current roster. Click a player to dive into their stats.
+          Top 5 teams in each vlr.gg region by official rating. Click a team to
+          see its current roster. Click a player to dive into their stats.
         </p>
       </motion.div>
 
@@ -114,7 +108,7 @@ export default function PlayersPage() {
         initial={{ opacity: 0 }}
         animate={{ opacity: 1 }}
         transition={{ delay: 0.15 }}
-        className="mt-10 flex gap-1 p-1 bg-surface border border-border rounded-xl w-fit"
+        className="mt-10 flex flex-wrap gap-1 p-1 bg-surface border border-border rounded-xl"
       >
         {REGIONS.map((r) => (
           <button
@@ -135,7 +129,7 @@ export default function PlayersPage() {
       {/* Top teams grid */}
       <div className="mt-6">
         <div className="text-[0.7rem] font-medium uppercase tracking-widest text-ink-dim mb-3">
-          Top 5 in {REGIONS.find((r) => r.value === region)?.label} · last 120 days
+          Top 5 in {REGIONS.find((r) => r.value === region)?.label} · by vlr.gg rating
         </div>
         {topTeams.length === 0 ? (
           <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
@@ -172,8 +166,8 @@ export default function PlayersPage() {
                         <div className="text-[0.65rem] font-mono uppercase tracking-widest text-ink-dim">
                           #{i + 1}
                         </div>
-                        <div className="font-mono text-xs text-ink-soft tabular">
-                          {t.win_pct.toFixed(0)}%
+                        <div className="font-mono text-xs text-ink-soft tabular" title="vlr.gg rating">
+                          {t.vlr_rating ?? '—'}
                         </div>
                       </div>
                       <div className="flex items-center gap-3 mb-2">
