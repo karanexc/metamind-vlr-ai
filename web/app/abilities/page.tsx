@@ -467,15 +467,87 @@ export default function AbilitiesPage() {
               {/* round detail */}
               <div className="bg-surface border border-border rounded-2xl p-4 min-h-[300px]">
                 {!gameRounds?.found && <div className="text-center text-ink-dim py-16">Pick a game to inspect its rounds.</div>}
-                {gameRounds?.found && gameRounds.rounds && (
+                {gameRounds?.found && gameRounds.rounds && (() => {
+                  const teamA = gameRounds.game?.team_a_tag ?? 'A';
+                  const teamB = gameRounds.game?.team_b_tag ?? 'B';
+                  const rnds = gameRounds.rounds ?? [];
+                  const scoreA = rnds.filter((r) => r.winner_tag === teamA).length;
+                  const scoreB = rnds.filter((r) => r.winner_tag === teamB).length;
+                  const tt = (tag: string) => gameRounds.teams?.find((t) => t.team_tag === tag);
+                  const roster = (tag: string) =>
+                    (gameRounds.players ?? []).filter((p) => p.team_tag === tag).sort((a, b) => b.kills - a.kills);
+                  const h = gameRounds.highlights;
+                  const utilA = tt(teamA)?.util ?? 0;
+                  const utilB = tt(teamB)?.util ?? 0;
+                  const utilTotal = Math.max(1, utilA + utilB);
+                  return (
                   <>
-                    <div className="flex items-center gap-2 mb-3 text-sm">
-                      <span className="font-semibold text-ink">{gameRounds.game?.team_a_tag} vs {gameRounds.game?.team_b_tag}</span>
-                      <span className="text-ink-dim">· {gameRounds.game?.map}</span>
+                    {/* score header */}
+                    <div className="flex items-center justify-between mb-4">
+                      <div className="flex items-center gap-3 text-sm">
+                        <span className={cn('font-semibold', gameRounds.game?.winner_tag === teamA ? 'text-accent' : 'text-ink')}>{teamA}</span>
+                        <span className="font-mono text-lg tabular text-ink">{scoreA}<span className="text-ink-dim mx-0.5">–</span>{scoreB}</span>
+                        <span className={cn('font-semibold', gameRounds.game?.winner_tag === teamB ? 'text-accent' : 'text-ink')}>{teamB}</span>
+                      </div>
+                      <span className="text-xs text-ink-dim">{gameRounds.game?.map} · {gameRounds.game?.year}</span>
                     </div>
-                    {/* round chips */}
+
+                    {/* impact highlights */}
+                    {h && (
+                      <div className="grid grid-cols-2 md:grid-cols-4 gap-2 mb-4">
+                        <Highlight label="Most utility" name={h.most_utility?.player_name}
+                          sub={h.most_utility ? `${h.most_utility.agent} · ${h.most_utility.value}` : undefined} />
+                        <Highlight label="Most ults" name={h.most_ults?.player_name}
+                          sub={h.most_ults ? `${h.most_ults.agent} · ${h.most_ults.value}` : undefined} />
+                        <Highlight label="Top fragger" name={h.top_fragger?.player_name}
+                          sub={h.top_fragger ? `${h.top_fragger.agent} · ${h.top_fragger.value}k` : undefined} />
+                        <Highlight label="Utility-edge rounds" name={`${h.utility_edge_rounds}/${h.total_rounds}`} sub="won by more util" />
+                      </div>
+                    )}
+
+                    {/* team utility comparison */}
+                    <div className="mb-4">
+                      <div className="flex justify-between text-[0.7rem] text-ink-dim mb-1">
+                        <span style={{ color: TEAM_HEX[0] }}>{teamA} · {utilA} util · {tt(teamA)?.ults ?? 0} ult</span>
+                        <span style={{ color: TEAM_HEX[1] }}>{utilB} util · {tt(teamB)?.ults ?? 0} ult · {teamB}</span>
+                      </div>
+                      <div className="h-2 rounded-full overflow-hidden flex bg-bg">
+                        <div style={{ width: `${(utilA / utilTotal) * 100}%`, background: TEAM_HEX[0] }} />
+                        <div style={{ width: `${(utilB / utilTotal) * 100}%`, background: TEAM_HEX[1] }} />
+                      </div>
+                    </div>
+
+                    {/* scoreboard: team / player / agent combined */}
+                    <div className="grid md:grid-cols-2 gap-3 mb-5">
+                      {[teamA, teamB].map((tag, ti) => (
+                        <div key={tag} className="border border-border rounded-xl overflow-hidden">
+                          <div className="px-3 py-1.5 text-xs font-semibold flex items-center justify-between border-b border-border" style={{ color: TEAM_HEX[ti] }}>
+                            <span>{tag}{gameRounds.game?.winner_tag === tag ? ' ✓' : ''}</span>
+                            <span className="text-ink-dim font-normal">util · ult · K/D</span>
+                          </div>
+                          <table className="w-full text-xs">
+                            <tbody>
+                              {roster(tag).map((p) => (
+                                <tr key={p.handle} className="border-t border-border first:border-0">
+                                  <td className="px-3 py-1.5 text-ink font-medium truncate max-w-[90px]">{p.player_name}</td>
+                                  <td className="px-1 py-1.5 text-ink-dim truncate" style={{ color: ROLE_HEX[p.role ?? ''] ?? undefined }}>{p.agent ?? '—'}</td>
+                                  <td className="px-2 py-1.5 text-right font-mono tabular text-accent font-semibold">{p.ability_casts}</td>
+                                  <td className="px-2 py-1.5 text-right font-mono tabular text-ink-soft">{p.ult_casts}</td>
+                                  <td className="px-3 py-1.5 text-right font-mono tabular text-ink-soft">{p.kills}/{p.deaths}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      ))}
+                    </div>
+
+                    {/* round-by-round */}
+                    <div className="text-[0.65rem] font-semibold uppercase tracking-widest text-ink-dim mb-2">
+                      Round by round {h?.decisive_round ? `· decisive: R${h.decisive_round}` : ''}
+                    </div>
                     <div className="flex flex-wrap gap-1.5 mb-4">
-                      {gameRounds.rounds.map((r) => (
+                      {rnds.map((r) => (
                         <button key={r.round_number} onClick={() => setSelectedRound(r.round_number)}
                           title={[r.is_pistol && 'pistol', r.is_map_point && 'map point', r.is_clutch && 'clutch'].filter(Boolean).join(' · ') || undefined}
                           className={cn('w-8 h-8 rounded-md text-xs font-mono tabular border transition-colors',
@@ -510,7 +582,8 @@ export default function AbilitiesPage() {
                       </div>
                     )}
                   </>
-                )}
+                  );
+                })()}
               </div>
             </motion.div>
           )}
@@ -536,5 +609,15 @@ function Badge({ icon, label }: { icon: React.ReactNode; label: string }) {
     <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[0.7rem] font-medium bg-bg border border-border text-ink-soft">
       {icon}{label}
     </span>
+  );
+}
+
+function Highlight({ label, name, sub }: { label: string; name?: string | null; sub?: string }) {
+  return (
+    <div className="bg-bg/40 border border-border rounded-lg px-3 py-2">
+      <div className="text-[0.6rem] uppercase tracking-widest text-ink-dim">{label}</div>
+      <div className="text-sm font-semibold text-ink truncate">{name ?? '—'}</div>
+      {sub && <div className="text-[0.65rem] text-ink-dim truncate">{sub}</div>}
+    </div>
   );
 }

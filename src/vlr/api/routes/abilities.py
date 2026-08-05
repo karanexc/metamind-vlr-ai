@@ -358,7 +358,8 @@ async def abilities_games(
 
 @router.get("/abilities/games/{game_id}/rounds")
 async def abilities_game_rounds(game_id: str) -> dict:
-    """One game's rounds + timelines (round view + decisive-round timeline)."""
+    """Full match breakdown: scoreboard (team/player/agent), impact highlights,
+    per-round outcomes + timelines."""
     session = get_session()
     try:
         g = session.get(VctGame, game_id)
@@ -368,6 +369,47 @@ async def abilities_game_rounds(game_id: str) -> dict:
             select(VctRound).where(VctRound.game_id == game_id)
             .order_by(VctRound.round_number)
         ).scalars().all()
+
+        pstats = session.execute(
+            select(VctAbilityStat).where(VctAbilityStat.game_id == game_id)
+        ).scalars().all()
+        players = [
+            {
+                "handle": p.handle, "player_name": p.player_name, "team_tag": p.team_tag,
+                "agent": p.agent, "role": p.role, "ability_casts": p.ability_casts,
+                "ult_casts": p.ult_casts, "kills": p.kills, "deaths": p.deaths, "won": p.won,
+            }
+            for p in pstats
+        ]
+        # team totals
+        teams: dict = {}
+        for p in pstats:
+            t = teams.setdefault(p.team_tag, {"team_tag": p.team_tag, "util": 0, "ults": 0, "kills": 0, "won": False})
+            t["util"] += p.ability_casts or 0
+            t["ults"] += p.ult_casts or 0
+            t["kills"] += p.kills or 0
+            t["won"] = t["won"] or bool(p.won)
+
+        # impact highlights
+        def _top(attr):
+            best = max(pstats, key=lambda p: getattr(p, attr) or 0, default=None)
+            if best is None or (getattr(best, attr) or 0) <= 0:
+                return None
+            return {"player_name": best.player_name, "agent": best.agent, "value": getattr(best, attr)}
+
+        edge_rounds = sum(1 for r in rounds if (r.winner_util or 0) > (r.loser_util or 0))
+        decisive = next((r.round_number for r in rounds if r.is_map_point), None)
+        if decisive is None:
+            decisive = next((r.round_number for r in rounds if r.is_clutch), None)
+        highlights = {
+            "most_utility": _top("ability_casts"),
+            "most_ults": _top("ult_casts"),
+            "top_fragger": _top("kills"),
+            "utility_edge_rounds": edge_rounds,
+            "total_rounds": len(rounds),
+            "decisive_round": decisive,
+        }
+
         return {
             "found": True,
             "game": {
@@ -376,6 +418,9 @@ async def abilities_game_rounds(game_id: str) -> dict:
                 "winner_tag": g.winner_tag, "total_rounds": g.total_rounds,
                 "played_at": g.played_at.isoformat() if g.played_at else None,
             },
+            "players": players,
+            "teams": list(teams.values()),
+            "highlights": highlights,
             "rounds": [
                 {
                     "round_number": r.round_number, "winner_tag": r.winner_tag,

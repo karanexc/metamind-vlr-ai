@@ -399,6 +399,36 @@ export interface VctRoundDetail {
   timeline: VctTimelineEvent[];
 }
 
+export interface VctMatchPlayer {
+  handle: string;
+  player_name: string;
+  team_tag: string | null;
+  agent: string | null;
+  role: string | null;
+  ability_casts: number;
+  ult_casts: number;
+  kills: number;
+  deaths: number;
+  won: boolean;
+}
+
+export interface VctMatchTeam {
+  team_tag: string | null;
+  util: number;
+  ults: number;
+  kills: number;
+  won: boolean;
+}
+
+export interface VctMatchHighlights {
+  most_utility: { player_name: string; agent: string | null; value: number } | null;
+  most_ults: { player_name: string; agent: string | null; value: number } | null;
+  top_fragger: { player_name: string; agent: string | null; value: number } | null;
+  utility_edge_rounds: number;
+  total_rounds: number;
+  decisive_round: number | null;
+}
+
 export interface VctGameRounds {
   found: boolean;
   game?: {
@@ -412,6 +442,9 @@ export interface VctGameRounds {
     total_rounds: number | null;
     played_at: string | null;
   };
+  players?: VctMatchPlayer[];
+  teams?: VctMatchTeam[];
+  highlights?: VctMatchHighlights;
   rounds?: VctRoundDetail[];
 }
 

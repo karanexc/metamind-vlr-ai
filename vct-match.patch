@@ -1,0 +1,245 @@
+diff --git a/src/vlr/api/routes/abilities.py b/src/vlr/api/routes/abilities.py
+index 55c2d45..06cf35d 100644
+--- a/src/vlr/api/routes/abilities.py
++++ b/src/vlr/api/routes/abilities.py
+@@ -358,7 +358,8 @@ async def abilities_games(
+ 
+ @router.get("/abilities/games/{game_id}/rounds")
+ async def abilities_game_rounds(game_id: str) -> dict:
+-    """One game's rounds + timelines (round view + decisive-round timeline)."""
++    """Full match breakdown: scoreboard (team/player/agent), impact highlights,
++    per-round outcomes + timelines."""
+     session = get_session()
+     try:
+         g = session.get(VctGame, game_id)
+@@ -368,6 +369,47 @@ async def abilities_game_rounds(game_id: str) -> dict:
+             select(VctRound).where(VctRound.game_id == game_id)
+             .order_by(VctRound.round_number)
+         ).scalars().all()
++
++        pstats = session.execute(
++            select(VctAbilityStat).where(VctAbilityStat.game_id == game_id)
++        ).scalars().all()
++        players = [
++            {
++                "handle": p.handle, "player_name": p.player_name, "team_tag": p.team_tag,
++                "agent": p.agent, "role": p.role, "ability_casts": p.ability_casts,
++                "ult_casts": p.ult_casts, "kills": p.kills, "deaths": p.deaths, "won": p.won,
++            }
++            for p in pstats
++        ]
++        # team totals
++        teams: dict = {}
++        for p in pstats:
++            t = teams.setdefault(p.team_tag, {"team_tag": p.team_tag, "util": 0, "ults": 0, "kills": 0, "won": False})
++            t["util"] += p.ability_casts or 0
++            t["ults"] += p.ult_casts or 0
++            t["kills"] += p.kills or 0
++            t["won"] = t["won"] or bool(p.won)
++
++        # impact highlights
++        def _top(attr):
++            best = max(pstats, key=lambda p: getattr(p, attr) or 0, default=None)
++            if best is None or (getattr(best, attr) or 0) <= 0:
++                return None
++            return {"player_name": best.player_name, "agent": best.agent, "value": getattr(best, attr)}
++
++        edge_rounds = sum(1 for r in rounds if (r.winner_util or 0) > (r.loser_util or 0))
++        decisive = next((r.round_number for r in rounds if r.is_map_point), None)
++        if decisive is None:
++            decisive = next((r.round_number for r in rounds if r.is_clutch), None)
++        highlights = {
++            "most_utility": _top("ability_casts"),
++            "most_ults": _top("ult_casts"),
++            "top_fragger": _top("kills"),
++            "utility_edge_rounds": edge_rounds,
++            "total_rounds": len(rounds),
++            "decisive_round": decisive,
++        }
++
+         return {
+             "found": True,
+             "game": {
+@@ -376,6 +418,9 @@ async def abilities_game_rounds(game_id: str) -> dict:
+                 "winner_tag": g.winner_tag, "total_rounds": g.total_rounds,
+                 "played_at": g.played_at.isoformat() if g.played_at else None,
+             },
++            "players": players,
++            "teams": list(teams.values()),
++            "highlights": highlights,
+             "rounds": [
+                 {
+                     "round_number": r.round_number, "winner_tag": r.winner_tag,
+diff --git a/web/app/abilities/page.tsx b/web/app/abilities/page.tsx
+index ce7bca1..96d612a 100644
+--- a/web/app/abilities/page.tsx
++++ b/web/app/abilities/page.tsx
+@@ -467,15 +467,87 @@ export default function AbilitiesPage() {
+               {/* round detail */}
+               <div className="bg-surface border border-border rounded-2xl p-4 min-h-[300px]">
+                 {!gameRounds?.found && <div className="text-center text-ink-dim py-16">Pick a game to inspect its rounds.</div>}
+-                {gameRounds?.found && gameRounds.rounds && (
++                {gameRounds?.found && gameRounds.rounds && (() => {
++                  const teamA = gameRounds.game?.team_a_tag ?? 'A';
++                  const teamB = gameRounds.game?.team_b_tag ?? 'B';
++                  const rnds = gameRounds.rounds ?? [];
++                  const scoreA = rnds.filter((r) => r.winner_tag === teamA).length;
++                  const scoreB = rnds.filter((r) => r.winner_tag === teamB).length;
++                  const tt = (tag: string) => gameRounds.teams?.find((t) => t.team_tag === tag);
++                  const roster = (tag: string) =>
++                    (gameRounds.players ?? []).filter((p) => p.team_tag === tag).sort((a, b) => b.kills - a.kills);
++                  const h = gameRounds.highlights;
++                  const utilA = tt(teamA)?.util ?? 0;
++                  const utilB = tt(teamB)?.util ?? 0;
++                  const utilTotal = Math.max(1, utilA + utilB);
++                  return (
+                   <>
+-                    <div className="flex items-center gap-2 mb-3 text-sm">
+-                      <span className="font-semibold text-ink">{gameRounds.game?.team_a_tag} vs {gameRounds.game?.team_b_tag}</span>
+-                      <span className="text-ink-dim">· {gameRounds.game?.map}</span>
++                    {/* score header */}
++                    <div className="flex items-center justify-between mb-4">
++                      <div className="flex items-center gap-3 text-sm">
++                        <span className={cn('font-semibold', gameRounds.game?.winner_tag === teamA ? 'text-accent' : 'text-ink')}>{teamA}</span>
++                        <span className="font-mono text-lg tabular text-ink">{scoreA}<span className="text-ink-dim mx-0.5">–</span>{scoreB}</span>
++                        <span className={cn('font-semibold', gameRounds.game?.winner_tag === teamB ? 'text-accent' : 'text-ink')}>{teamB}</span>
++                      </div>
++                      <span className="text-xs text-ink-dim">{gameRounds.game?.map} · {gameRounds.game?.year}</span>
++                    </div>
++
++                    {/* impact highlights */}
++                    {h && (
++                      <div className="grid grid-cols-2 md:grid-cols-4 gap-2 mb-4">
++                        <Highlight label="Most utility" name={h.most_utility?.player_name}
++                          sub={h.most_utility ? `${h.most_utility.agent} · ${h.most_utility.value}` : undefined} />
++                        <Highlight label="Most ults" name={h.most_ults?.player_name}
++                          sub={h.most_ults ? `${h.most_ults.agent} · ${h.most_ults.value}` : undefined} />
++                        <Highlight label="Top fragger" name={h.top_fragger?.player_name}
++                          sub={h.top_fragger ? `${h.top_fragger.agent} · ${h.top_fragger.value}k` : undefined} />
++                        <Highlight label="Utility-edge rounds" name={`${h.utility_edge_rounds}/${h.total_rounds}`} sub="won by more util" />
++                      </div>
++                    )}
++
++                    {/* team utility comparison */}
++                    <div className="mb-4">
++                      <div className="flex justify-between text-[0.7rem] text-ink-dim mb-1">
++                        <span style={{ color: TEAM_HEX[0] }}>{teamA} · {utilA} util · {tt(teamA)?.ults ?? 0} ult</span>
++                        <span style={{ color: TEAM_HEX[1] }}>{utilB} util · {tt(teamB)?.ults ?? 0} ult · {teamB}</span>
++                      </div>
++                      <div className="h-2 rounded-full overflow-hidden flex bg-bg">
++                        <div style={{ width: `${(utilA / utilTotal) * 100}%`, background: TEAM_HEX[0] }} />
++                        <div style={{ width: `${(utilB / utilTotal) * 100}%`, background: TEAM_HEX[1] }} />
++                      </div>
++                    </div>
++
++                    {/* scoreboard: team / player / agent combined */}
++                    <div className="grid md:grid-cols-2 gap-3 mb-5">
++                      {[teamA, teamB].map((tag, ti) => (
++                        <div key={tag} className="border border-border rounded-xl overflow-hidden">
++                          <div className="px-3 py-1.5 text-xs font-semibold flex items-center justify-between border-b border-border" style={{ color: TEAM_HEX[ti] }}>
++                            <span>{tag}{gameRounds.game?.winner_tag === tag ? ' ✓' : ''}</span>
++                            <span className="text-ink-dim font-normal">util · ult · K/D</span>
++                          </div>
++                          <table className="w-full text-xs">
++                            <tbody>
++                              {roster(tag).map((p) => (
++                                <tr key={p.handle} className="border-t border-border first:border-0">
++                                  <td className="px-3 py-1.5 text-ink font-medium truncate max-w-[90px]">{p.player_name}</td>
++                                  <td className="px-1 py-1.5 text-ink-dim truncate" style={{ color: ROLE_HEX[p.role ?? ''] ?? undefined }}>{p.agent ?? '—'}</td>
++                                  <td className="px-2 py-1.5 text-right font-mono tabular text-accent font-semibold">{p.ability_casts}</td>
++                                  <td className="px-2 py-1.5 text-right font-mono tabular text-ink-soft">{p.ult_casts}</td>
++                                  <td className="px-3 py-1.5 text-right font-mono tabular text-ink-soft">{p.kills}/{p.deaths}</td>
++                                </tr>
++                              ))}
++                            </tbody>
++                          </table>
++                        </div>
++                      ))}
++                    </div>
++
++                    {/* round-by-round */}
++                    <div className="text-[0.65rem] font-semibold uppercase tracking-widest text-ink-dim mb-2">
++                      Round by round {h?.decisive_round ? `· decisive: R${h.decisive_round}` : ''}
+                     </div>
+-                    {/* round chips */}
+                     <div className="flex flex-wrap gap-1.5 mb-4">
+-                      {gameRounds.rounds.map((r) => (
++                      {rnds.map((r) => (
+                         <button key={r.round_number} onClick={() => setSelectedRound(r.round_number)}
+                           title={[r.is_pistol && 'pistol', r.is_map_point && 'map point', r.is_clutch && 'clutch'].filter(Boolean).join(' · ') || undefined}
+                           className={cn('w-8 h-8 rounded-md text-xs font-mono tabular border transition-colors',
+@@ -510,7 +582,8 @@ export default function AbilitiesPage() {
+                       </div>
+                     )}
+                   </>
+-                )}
++                  );
++                })()}
+               </div>
+             </motion.div>
+           )}
+@@ -538,3 +611,13 @@ function Badge({ icon, label }: { icon: React.ReactNode; label: string }) {
+     </span>
+   );
+ }
++
++function Highlight({ label, name, sub }: { label: string; name?: string | null; sub?: string }) {
++  return (
++    <div className="bg-bg/40 border border-border rounded-lg px-3 py-2">
++      <div className="text-[0.6rem] uppercase tracking-widest text-ink-dim">{label}</div>
++      <div className="text-sm font-semibold text-ink truncate">{name ?? '—'}</div>
++      {sub && <div className="text-[0.65rem] text-ink-dim truncate">{sub}</div>}
++    </div>
++  );
++}
+diff --git a/web/lib/api.ts b/web/lib/api.ts
+index d7b0dde..d7fd1eb 100644
+--- a/web/lib/api.ts
++++ b/web/lib/api.ts
+@@ -399,6 +399,36 @@ export interface VctRoundDetail {
+   timeline: VctTimelineEvent[];
+ }
+ 
++export interface VctMatchPlayer {
++  handle: string;
++  player_name: string;
++  team_tag: string | null;
++  agent: string | null;
++  role: string | null;
++  ability_casts: number;
++  ult_casts: number;
++  kills: number;
++  deaths: number;
++  won: boolean;
++}
++
++export interface VctMatchTeam {
++  team_tag: string | null;
++  util: number;
++  ults: number;
++  kills: number;
++  won: boolean;
++}
++
++export interface VctMatchHighlights {
++  most_utility: { player_name: string; agent: string | null; value: number } | null;
++  most_ults: { player_name: string; agent: string | null; value: number } | null;
++  top_fragger: { player_name: string; agent: string | null; value: number } | null;
++  utility_edge_rounds: number;
++  total_rounds: number;
++  decisive_round: number | null;
++}
++
+ export interface VctGameRounds {
+   found: boolean;
+   game?: {
+@@ -412,6 +442,9 @@ export interface VctGameRounds {
+     total_rounds: number | null;
+     played_at: string | null;
+   };
++  players?: VctMatchPlayer[];
++  teams?: VctMatchTeam[];
++  highlights?: VctMatchHighlights;
+   rounds?: VctRoundDetail[];
+ }
+ 
