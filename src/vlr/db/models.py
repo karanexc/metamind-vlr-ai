@@ -212,3 +212,90 @@ class MatchAnalysisCache(Base):
     )
 
     match = relationship("Match")
+
+
+# --- VCT esports telemetry (historical ability data) ---------------------
+# Separate, self-contained tables fed by `vlr.vct` from Riot's public VCT
+# dataset (2022-2024). Decoupled from the live vlr scrape — no FKs into the
+# vlr tables; players link to the live data by handle/name at query time.
+
+
+class VctGame(Base):
+    """One imported VCT esports game (map), keyed by Riot's platformGameId."""
+
+    __tablename__ = "vct_games"
+
+    game_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tier: Mapped[str] = mapped_column(String(32), nullable=False)  # game-changers / vct-challengers / vct-international
+    year: Mapped[int] = mapped_column(Integer, nullable=False)
+    map_name: Mapped[Optional[str]] = mapped_column(String(64))
+    played_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    total_rounds: Mapped[Optional[int]] = mapped_column(Integer)
+    team_a_tag: Mapped[Optional[str]] = mapped_column(String(64))
+    team_b_tag: Mapped[Optional[str]] = mapped_column(String(64))
+    winner_tag: Mapped[Optional[str]] = mapped_column(String(64))
+    imported_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=datetime.utcnow, nullable=False
+    )
+
+    ability_stats = relationship(
+        "VctAbilityStat", back_populates="game", cascade="all, delete-orphan"
+    )
+
+
+class VctAbilityStat(Base):
+    """Per (game, player) derived ability + ultimate usage from Riot telemetry."""
+
+    __tablename__ = "vct_ability_stats"
+    __table_args__ = (
+        UniqueConstraint("game_id", "handle", name="uq_vct_player_per_game"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    game_id: Mapped[str] = mapped_column(String(64), ForeignKey("vct_games.game_id"), nullable=False)
+    handle: Mapped[str] = mapped_column(String(128), nullable=False)   # full in-game name, e.g. "SMG Yoky"
+    player_name: Mapped[str] = mapped_column(String(128), nullable=False, index=True)  # tag stripped, for linking
+    team_tag: Mapped[Optional[str]] = mapped_column(String(64))
+    agent: Mapped[Optional[str]] = mapped_column(String(64), index=True)
+    role: Mapped[Optional[str]] = mapped_column(String(32))
+    rounds: Mapped[Optional[int]] = mapped_column(Integer)
+    # Derived from state snapshots (charge decrements within rounds).
+    ability_casts: Mapped[int] = mapped_column(Integer, default=0)   # ability_1 + ability_2 + grenade
+    ult_casts: Mapped[int] = mapped_column(Integer, default=0)
+    kills: Mapped[int] = mapped_column(Integer, default=0)
+    deaths: Mapped[int] = mapped_column(Integer, default=0)
+    won: Mapped[bool] = mapped_column(default=False)
+
+    game = relationship("VctGame", back_populates="ability_stats")
+
+
+class VctRound(Base):
+    """One row per (game, round): outcome + per-team utility/ult + a compact
+    event timeline (casts, ults, kills, spike). Powers the round-impact and
+    timeline views."""
+
+    __tablename__ = "vct_rounds"
+    __table_args__ = (
+        UniqueConstraint("game_id", "round_number", name="uq_vct_round_per_game"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    game_id: Mapped[str] = mapped_column(String(64), ForeignKey("vct_games.game_id"), nullable=False)
+    round_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    winner_tag: Mapped[Optional[str]] = mapped_column(String(64))
+    win_condition: Mapped[Optional[str]] = mapped_column(String(32))  # ELIMINATION / SPIKE_DEFUSE / DETONATE / ...
+    attacker_tag: Mapped[Optional[str]] = mapped_column(String(64))
+    winner_util: Mapped[int] = mapped_column(Integer, default=0)
+    loser_util: Mapped[int] = mapped_column(Integer, default=0)
+    winner_ults: Mapped[int] = mapped_column(Integer, default=0)
+    loser_ults: Mapped[int] = mapped_column(Integer, default=0)
+    opening_kill_tag: Mapped[Optional[str]] = mapped_column(String(64))
+    spike_planted: Mapped[bool] = mapped_column(default=False)
+    spike_defused: Mapped[bool] = mapped_column(default=False)
+    is_pistol: Mapped[bool] = mapped_column(default=False)
+    is_map_point: Mapped[bool] = mapped_column(default=False)
+    is_clutch: Mapped[bool] = mapped_column(default=False)
+    # Compact timeline: [{"t": sec_into_round, "k": ability|ult|kill|plant|defuse, "team": 0|1, "slot"?}]
+    timeline: Mapped[Optional[dict]] = mapped_column(JSONB)
+
+    game = relationship("VctGame")

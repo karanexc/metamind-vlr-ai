@@ -309,6 +309,112 @@ export interface LeaderboardTeam extends RegionalTeam {
   }[];
 }
 
+// VCT ability telemetry (historical 2022-24 module)
+export interface AbilitySummary {
+  games: number;
+  players: number;
+  agents: number;
+  year_min: number | null;
+  year_max: number | null;
+  tiers: string[];
+}
+
+export interface AbilityAgent {
+  agent: string;
+  role: string | null;
+  games: number;
+  ability_casts_per_round: number;
+  ults_per_game: number;
+  ult_per_round: number;
+  kd: number;
+  win_rate: number;
+}
+
+export interface AbilityPlayer {
+  player_name: string;
+  team_tag: string | null;
+  games: number;
+  ability_casts_per_round: number;
+  ults_per_game: number;
+  kd: number;
+  win_rate: number;
+  found?: boolean;
+  agents?: { agent: string; games: number; ults: number }[];
+}
+
+export interface AbilityImpact {
+  rounds: number;
+  utility_edge_win_rate: number;
+  ult_win_rate: number;
+  util_diff_buckets: { bucket: string; n: number; win_rate: number }[];
+  ult_buckets: { ults: string; n: number; win_rate: number }[];
+  by_condition: { condition: string; rounds: number; avg_util: number; avg_ults: number }[];
+}
+
+export interface MapImpact {
+  map: string;
+  games: number;
+  rounds: number;
+  utility_edge_win_rate: number;
+  ult_win_rate: number;
+  avg_util_per_round: number;
+}
+
+export interface VctGameListItem {
+  game_id: string;
+  map: string | null;
+  tier: string;
+  year: number;
+  team_a_tag: string | null;
+  team_b_tag: string | null;
+  winner_tag: string | null;
+  score_a: number;
+  score_b: number;
+  played_at: string | null;
+  total_rounds: number | null;
+}
+
+export interface VctTimelineEvent {
+  t: number | null;
+  k: string; // ability | ult | kill | plant | defuse
+  team: number | null; // 0 = team A, 1 = team B
+  slot?: string;
+}
+
+export interface VctRoundDetail {
+  round_number: number;
+  winner_tag: string | null;
+  win_condition: string | null;
+  attacker_tag: string | null;
+  winner_util: number;
+  loser_util: number;
+  winner_ults: number;
+  loser_ults: number;
+  opening_kill_tag: string | null;
+  spike_planted: boolean;
+  spike_defused: boolean;
+  is_pistol: boolean;
+  is_map_point: boolean;
+  is_clutch: boolean;
+  timeline: VctTimelineEvent[];
+}
+
+export interface VctGameRounds {
+  found: boolean;
+  game?: {
+    game_id: string;
+    map: string | null;
+    tier: string;
+    year: number;
+    team_a_tag: string | null;
+    team_b_tag: string | null;
+    winner_tag: string | null;
+    total_rounds: number | null;
+    played_at: string | null;
+  };
+  rounds?: VctRoundDetail[];
+}
+
 // --- API methods --------------------------------------------------------
 
 export const api = {
@@ -394,4 +500,30 @@ export const api = {
     request<EventPlayer[]>(`/api/v1/depth/events/${eventId}/players`),
   playerEventAnalysis: (eventId: number, playerId: number) =>
     request<PlayerEventAnalysis>(`/api/v1/depth/events/${eventId}/players/${playerId}`),
+
+  // VCT ability telemetry (historical 2022-24)
+  abilitiesSummary: () => request<AbilitySummary>('/api/v1/abilities/summary'),
+  abilitiesAgents: (minGames = 5, map = '') =>
+    request<AbilityAgent[]>(
+      `/api/v1/abilities/agents?min_games=${minGames}${map ? `&map=${encodeURIComponent(map)}` : ''}`,
+    ),
+  abilitiesPlayers: (search = '', limit = 50) =>
+    request<AbilityPlayer[]>(
+      `/api/v1/abilities/players?search=${encodeURIComponent(search)}&limit=${limit}`,
+    ),
+  abilitiesPlayer: (name: string) =>
+    request<AbilityPlayer>(`/api/v1/abilities/players/${encodeURIComponent(name)}`),
+  abilitiesImpact: (map = '') =>
+    request<AbilityImpact>(
+      `/api/v1/abilities/impact${map ? `?map=${encodeURIComponent(map)}` : ''}`,
+    ),
+  abilitiesImpactMaps: () => request<MapImpact[]>('/api/v1/abilities/impact/maps'),
+  abilitiesGames: (opts: { map?: string; search?: string; limit?: number } = {}) =>
+    request<VctGameListItem[]>(
+      `/api/v1/abilities/games?map=${encodeURIComponent(opts.map ?? '')}&search=${encodeURIComponent(
+        opts.search ?? '',
+      )}&limit=${opts.limit ?? 60}`,
+    ),
+  abilitiesGameRounds: (gameId: string) =>
+    request<VctGameRounds>(`/api/v1/abilities/games/${encodeURIComponent(gameId)}/rounds`),
 };

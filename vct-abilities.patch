@@ -1,0 +1,1049 @@
+diff --git a/src/vlr/api/main.py b/src/vlr/api/main.py
+index 7919076..f639f5c 100644
+--- a/src/vlr/api/main.py
++++ b/src/vlr/api/main.py
+@@ -17,7 +17,7 @@ from slowapi import _rate_limit_exceeded_handler
+ from slowapi.errors import RateLimitExceeded
+ 
+ from .limits import limiter
+-from .routes import depth, explain, live, matches, meta, pickem, players, predict, stats, teams
++from .routes import abilities, depth, explain, live, matches, meta, pickem, players, predict, stats, teams
+ from .scheduler import start_scheduler, stop_scheduler
+ 
+ log = logging.getLogger(__name__)
+@@ -113,6 +113,7 @@ app.include_router(pickem.router, prefix=API_PREFIX, tags=["pickem"])
+ app.include_router(live.router, prefix=API_PREFIX, tags=["live"])
+ app.include_router(meta.router, prefix=API_PREFIX, tags=["meta"])
+ app.include_router(depth.router, prefix=API_PREFIX, tags=["depth"])
++app.include_router(abilities.router, prefix=API_PREFIX, tags=["abilities"])
+ 
+ 
+ # --- Generic error handler ------------------------------------------------
+diff --git a/src/vlr/api/routes/abilities.py b/src/vlr/api/routes/abilities.py
+new file mode 100644
+index 0000000..44c1eab
+--- /dev/null
++++ b/src/vlr/api/routes/abilities.py
+@@ -0,0 +1,158 @@
++"""VCT ability telemetry endpoints — the historical (2022-24) ability module.
++
++Serves derived ability + ultimate usage aggregated from Riot's VCT dataset.
++All data is clearly historical and separate from the live vlr scrape.
++"""
++from __future__ import annotations
++
++from fastapi import APIRouter, Query
++from sqlalchemy import Integer, cast, func, select
++
++from vlr.db.models import VctAbilityStat, VctGame
++from vlr.db.session import get_session
++
++router = APIRouter()
++
++
++def _rate(n, d):
++    return round(n / d, 2) if d else 0.0
++
++
++@router.get("/abilities/summary")
++async def abilities_summary() -> dict:
++    """Coverage of the imported VCT ability corpus."""
++    session = get_session()
++    try:
++        games = session.execute(select(func.count(VctGame.game_id))).scalar() or 0
++        players = session.execute(
++            select(func.count(func.distinct(VctAbilityStat.player_name)))
++        ).scalar() or 0
++        agents = session.execute(
++            select(func.count(func.distinct(VctAbilityStat.agent)))
++            .where(VctAbilityStat.agent.isnot(None))
++        ).scalar() or 0
++        yr = session.execute(select(func.min(VctGame.year), func.max(VctGame.year))).one()
++        tiers = session.execute(select(func.distinct(VctGame.tier))).scalars().all()
++        return {
++            "games": int(games), "players": int(players), "agents": int(agents),
++            "year_min": yr[0], "year_max": yr[1], "tiers": list(tiers),
++        }
++    finally:
++        session.close()
++
++
++@router.get("/abilities/agents")
++async def abilities_agents(min_games: int = Query(5, ge=1, le=1000)) -> list[dict]:
++    """Per-agent ability/ult usage, ordered by ability activity per round."""
++    session = get_session()
++    try:
++        rows = session.execute(
++            select(
++                VctAbilityStat.agent,
++                func.max(VctAbilityStat.role),
++                func.count().label("n"),
++                func.coalesce(func.sum(VctAbilityStat.rounds), 0),
++                func.coalesce(func.sum(VctAbilityStat.ability_casts), 0),
++                func.coalesce(func.sum(VctAbilityStat.ult_casts), 0),
++                func.coalesce(func.sum(VctAbilityStat.kills), 0),
++                func.coalesce(func.sum(VctAbilityStat.deaths), 0),
++                func.coalesce(func.sum(cast(VctAbilityStat.won, Integer)), 0),
++            )
++            .where(VctAbilityStat.agent.isnot(None))
++            .group_by(VctAbilityStat.agent)
++            .having(func.count() >= min_games)
++        ).all()
++
++        out = []
++        for agent, role, n, rounds, ab, ult, k, d, wins in rows:
++            out.append({
++                "agent": agent, "role": role, "games": int(n),
++                "ability_casts_per_round": _rate(ab, rounds),
++                "ults_per_game": _rate(ult, n),
++                "ult_per_round": _rate(ult, rounds),
++                "kd": _rate(k, d),
++                "win_rate": round(100.0 * wins / n, 1) if n else 0.0,
++            })
++        out.sort(key=lambda r: r["ability_casts_per_round"], reverse=True)
++        return out
++    finally:
++        session.close()
++
++
++def _player_rows(session, where=None, limit=None):
++    q = (
++        select(
++            VctAbilityStat.player_name,
++            func.count().label("n"),
++            func.coalesce(func.sum(VctAbilityStat.rounds), 0),
++            func.coalesce(func.sum(VctAbilityStat.ability_casts), 0),
++            func.coalesce(func.sum(VctAbilityStat.ult_casts), 0),
++            func.coalesce(func.sum(VctAbilityStat.kills), 0),
++            func.coalesce(func.sum(VctAbilityStat.deaths), 0),
++            func.coalesce(func.sum(cast(VctAbilityStat.won, Integer)), 0),
++            func.max(VctAbilityStat.team_tag),
++        )
++        .group_by(VctAbilityStat.player_name)
++    )
++    if where is not None:
++        q = q.where(where)
++    if limit:
++        q = q.order_by(func.count().desc()).limit(limit)
++    return session.execute(q).all()
++
++
++def _shape_player(row) -> dict:
++    name, n, rounds, ab, ult, k, d, wins, tag = row
++    return {
++        "player_name": name, "team_tag": tag, "games": int(n),
++        "ability_casts_per_round": _rate(ab, rounds),
++        "ults_per_game": _rate(ult, n),
++        "kd": _rate(k, d),
++        "win_rate": round(100.0 * wins / n, 1) if n else 0.0,
++    }
++
++
++@router.get("/abilities/players")
++async def abilities_players(
++    search: str = Query("", max_length=64),
++    limit: int = Query(50, ge=1, le=200),
++) -> list[dict]:
++    """Player ability profiles (searchable). Links to live players by name."""
++    session = get_session()
++    try:
++        where = None
++        if search.strip():
++            where = VctAbilityStat.player_name.ilike(f"%{search.strip()}%")
++        rows = _player_rows(session, where=where, limit=limit)
++        return [_shape_player(r) for r in rows]
++    finally:
++        session.close()
++
++
++@router.get("/abilities/players/{name}")
++async def abilities_player(name: str) -> dict:
++    """One player's ability profile + per-agent breakdown. 404-safe (empty)."""
++    session = get_session()
++    try:
++        rows = _player_rows(session, where=VctAbilityStat.player_name.ilike(name))
++        if not rows:
++            return {"found": False, "player_name": name}
++        profile = _shape_player(rows[0])
++        agents = session.execute(
++            select(
++                VctAbilityStat.agent,
++                func.count(),
++                func.coalesce(func.sum(VctAbilityStat.ult_casts), 0),
++            )
++            .where(VctAbilityStat.player_name.ilike(name))
++            .where(VctAbilityStat.agent.isnot(None))
++            .group_by(VctAbilityStat.agent)
++            .order_by(func.count().desc())
++        ).all()
++        profile["found"] = True
++        profile["agents"] = [
++            {"agent": a, "games": int(c), "ults": int(u)} for a, c, u in agents
++        ]
++        return profile
++    finally:
++        session.close()
+diff --git a/src/vlr/cli.py b/src/vlr/cli.py
+index 0d78d3d..0a4b1ab 100644
+--- a/src/vlr/cli.py
++++ b/src/vlr/cli.py
+@@ -68,6 +68,33 @@ def init_db_cmd() -> None:
+     """
+     _configure_logging(verbose=False)
+     _init_db()
++
++
++@app.command("import-vct-abilities")
++def import_vct_abilities_cmd(
++    tier: str = typer.Option(
++        "vct-international",
++        help="game-changers | vct-challengers | vct-international",
++    ),
++    year: int = typer.Option(2024, help="2022, 2023 or 2024"),
++    limit: Optional[int] = typer.Option(None, help="max games to import (subset)"),
++    verbose: bool = typer.Option(False, "--verbose", "-v"),
++) -> None:
++    """Import Riot's VCT esports telemetry -> derived ability/ult usage (2022-24).
++
++    Historical, one-time (idempotent) import — separate from the live scrape.
++    Run `init-db` first so the vct_* tables exist. Example:
++        python -m src.vlr.cli import-vct-abilities --tier vct-international --year 2024 --limit 150
++    """
++    _configure_logging(verbose)
++    from .vct.loader import import_vct_games
++
++    def _prog(i: int, total: int, gid: str, status: str) -> None:
++        if status in ("ok", "error", "empty") or i % 25 == 0:
++            console.print(f"[{i + 1}/{total}] {gid[:22]} -> {status}")
++
++    result = import_vct_games(tier, year, limit=limit, on_progress=_prog)
++    console.print(f"[bold green]VCT import done[/]: {result}")
+     console.print("[green]Schema created and migrations applied.[/green]")
+ 
+     # Check whether tier classifications are missing — common after a 7b upgrade
+diff --git a/src/vlr/db/models.py b/src/vlr/db/models.py
+index f80b82d..32b9c3d 100644
+--- a/src/vlr/db/models.py
++++ b/src/vlr/db/models.py
+@@ -212,3 +212,58 @@ class MatchAnalysisCache(Base):
+     )
+ 
+     match = relationship("Match")
++
++
++# --- VCT esports telemetry (historical ability data) ---------------------
++# Separate, self-contained tables fed by `vlr.vct` from Riot's public VCT
++# dataset (2022-2024). Decoupled from the live vlr scrape — no FKs into the
++# vlr tables; players link to the live data by handle/name at query time.
++
++
++class VctGame(Base):
++    """One imported VCT esports game (map), keyed by Riot's platformGameId."""
++
++    __tablename__ = "vct_games"
++
++    game_id: Mapped[str] = mapped_column(String(64), primary_key=True)
++    tier: Mapped[str] = mapped_column(String(32), nullable=False)  # game-changers / vct-challengers / vct-international
++    year: Mapped[int] = mapped_column(Integer, nullable=False)
++    map_name: Mapped[Optional[str]] = mapped_column(String(64))
++    played_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
++    total_rounds: Mapped[Optional[int]] = mapped_column(Integer)
++    team_a_tag: Mapped[Optional[str]] = mapped_column(String(64))
++    team_b_tag: Mapped[Optional[str]] = mapped_column(String(64))
++    winner_tag: Mapped[Optional[str]] = mapped_column(String(64))
++    imported_at: Mapped[datetime] = mapped_column(
++        DateTime(timezone=True), default=datetime.utcnow, nullable=False
++    )
++
++    ability_stats = relationship(
++        "VctAbilityStat", back_populates="game", cascade="all, delete-orphan"
++    )
++
++
++class VctAbilityStat(Base):
++    """Per (game, player) derived ability + ultimate usage from Riot telemetry."""
++
++    __tablename__ = "vct_ability_stats"
++    __table_args__ = (
++        UniqueConstraint("game_id", "handle", name="uq_vct_player_per_game"),
++    )
++
++    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
++    game_id: Mapped[str] = mapped_column(String(64), ForeignKey("vct_games.game_id"), nullable=False)
++    handle: Mapped[str] = mapped_column(String(128), nullable=False)   # full in-game name, e.g. "SMG Yoky"
++    player_name: Mapped[str] = mapped_column(String(128), nullable=False, index=True)  # tag stripped, for linking
++    team_tag: Mapped[Optional[str]] = mapped_column(String(64))
++    agent: Mapped[Optional[str]] = mapped_column(String(64), index=True)
++    role: Mapped[Optional[str]] = mapped_column(String(32))
++    rounds: Mapped[Optional[int]] = mapped_column(Integer)
++    # Derived from state snapshots (charge decrements within rounds).
++    ability_casts: Mapped[int] = mapped_column(Integer, default=0)   # ability_1 + ability_2 + grenade
++    ult_casts: Mapped[int] = mapped_column(Integer, default=0)
++    kills: Mapped[int] = mapped_column(Integer, default=0)
++    deaths: Mapped[int] = mapped_column(Integer, default=0)
++    won: Mapped[bool] = mapped_column(default=False)
++
++    game = relationship("VctGame", back_populates="ability_stats")
+diff --git a/src/vlr/vct/__init__.py b/src/vlr/vct/__init__.py
+new file mode 100644
+index 0000000..e334a1d
+--- /dev/null
++++ b/src/vlr/vct/__init__.py
+@@ -0,0 +1,10 @@
++"""VCT esports telemetry module.
++
++A self-contained, historical add-on to the live vlr pipeline. It imports Riot's
++publicly-released VCT esports game data (the "VCT Hackathon" S3 dataset,
++2022-2024) and derives per-player / per-agent ABILITY and ULTIMATE usage —
++data vlr.gg does not expose. It links to the live players by handle.
++
++Kept deliberately decoupled: nothing here runs on the 2-hour scheduler; it's a
++one-time (re-runnable) import via `python -m src.vlr.cli import-vct-abilities`.
++"""
+diff --git a/src/vlr/vct/download.py b/src/vlr/vct/download.py
+new file mode 100644
+index 0000000..3cf6639
+--- /dev/null
++++ b/src/vlr/vct/download.py
+@@ -0,0 +1,86 @@
++"""Fetch helpers for the public VCT esports dataset + valorant-api art refs.
++
++The dataset lives in a public S3 bucket (no credentials needed):
++    https://vcthackathon-data.s3.amazonaws.com/
++    <tier>/games/<year>/<platformGameId>.json.gz    (gzipped event stream)
++
++Agent/map GUIDs resolve via the free valorant-api.com community API.
++Everything here is stdlib-only (urllib + gzip) — no boto3, no new deps.
++"""
++from __future__ import annotations
++
++import gzip
++import json
++import re
++import urllib.parse
++import urllib.request
++from typing import Optional
++
++S3_BASE = "https://vcthackathon-data.s3.amazonaws.com/"
++_UA = {"User-Agent": "Mozilla/5.0 (vlr-analytics VCT importer)"}
++TIERS = ("game-changers", "vct-challengers", "vct-international")
++
++
++def _get(url: str, timeout: int = 120) -> bytes:
++    return urllib.request.urlopen(
++        urllib.request.Request(url, headers=_UA), timeout=timeout
++    ).read()
++
++
++def list_game_keys(tier: str, year: int, limit: Optional[int] = None) -> list[str]:
++    """S3 keys for game files under <tier>/games/<year>/ (handles pagination)."""
++    prefix = f"{tier}/games/{year}/"
++    keys: list[str] = []
++    token: Optional[str] = None
++    while True:
++        url = S3_BASE + f"?list-type=2&prefix={urllib.parse.quote(prefix)}&max-keys=1000"
++        if token:
++            url += f"&continuation-token={urllib.parse.quote(token)}"
++        xml = _get(url).decode("utf-8", "replace")
++        keys.extend(re.findall(r"<Key>([^<]+\.json\.gz)</Key>", xml))
++        if limit and len(keys) >= limit:
++            return keys[:limit]
++        m = re.search(r"<NextContinuationToken>([^<]+)</NextContinuationToken>", xml)
++        if not m:
++            break
++        token = m.group(1)
++    return keys[:limit] if limit else keys
++
++
++def fetch_game(key: str) -> list:
++    """Download + decompress one game file into its list of events."""
++    raw = _get(S3_BASE + urllib.parse.quote(key, safe="/"))
++    return json.loads(gzip.decompress(raw).decode("utf-8", "replace"))
++
++
++_agent_map: Optional[dict] = None
++_map_map: Optional[dict] = None
++
++
++def agent_map() -> dict:
++    """{AGENT_GUID_UPPER: (name, role)} from valorant-api (cached, fails soft)."""
++    global _agent_map
++    if _agent_map is None:
++        try:
++            data = json.loads(_get(
++                "https://valorant-api.com/v1/agents?isPlayableCharacter=true", 60
++            ).decode("utf-8", "replace"))
++            _agent_map = {
++                a["uuid"].upper(): (a["displayName"], (a.get("role") or {}).get("displayName"))
++                for a in data.get("data", [])
++            }
++        except Exception:
++            _agent_map = {}
++    return _agent_map
++
++
++def map_map() -> dict:
++    """{map_asset_path: display_name} from valorant-api (cached, fails soft)."""
++    global _map_map
++    if _map_map is None:
++        try:
++            data = json.loads(_get("https://valorant-api.com/v1/maps", 60).decode("utf-8", "replace"))
++            _map_map = {m["mapUrl"]: m["displayName"] for m in data.get("data", []) if m.get("mapUrl")}
++        except Exception:
++            _map_map = {}
++    return _map_map
+diff --git a/src/vlr/vct/loader.py b/src/vlr/vct/loader.py
+new file mode 100644
+index 0000000..ae4f048
+--- /dev/null
++++ b/src/vlr/vct/loader.py
+@@ -0,0 +1,116 @@
++"""Import VCT games into Postgres: download -> parse -> aggregate -> upsert.
++
++Idempotent: games already in `vct_games` are skipped, so it's safe to re-run
++and to stop/resume. Not wired into the scheduler — run on demand via the CLI.
++"""
++from __future__ import annotations
++
++import logging
++import time
++from collections import Counter
++from datetime import datetime
++from typing import Optional
++
++from sqlalchemy import select
++
++from ..db.models import VctAbilityStat, VctGame
++from ..db.session import get_session
++from . import download
++from .parse import parse_game
++
++log = logging.getLogger(__name__)
++
++
++def _team_tag(handles: list[str]) -> Optional[str]:
++    """Most common leading token among handles, e.g. 'SMG Yoky' -> 'SMG'."""
++    tags = [h.split(" ", 1)[0] for h in handles if h and " " in h]
++    if not tags:
++        return None
++    return Counter(tags).most_common(1)[0][0]
++
++
++def _player_name(handle: str, tag: Optional[str]) -> str:
++    """Strip the team tag so the name links to the live vlr player list."""
++    if tag and handle.startswith(tag + " "):
++        return handle[len(tag) + 1:].strip()
++    return handle.strip()
++
++
++def _parse_dt(iso: Optional[str]) -> Optional[datetime]:
++    if not iso:
++        return None
++    try:
++        return datetime.fromisoformat(iso.replace("Z", "+00:00"))
++    except Exception:
++        return None
++
++
++def import_vct_games(tier: str, year: int, limit: Optional[int] = None,
++                     delay: float = 0.0, on_progress=None) -> dict:
++    """Import a subset of VCT games for (tier, year). Returns a stats dict."""
++    stats = {"scanned": 0, "imported": 0, "skipped": 0, "failed": 0, "players": 0}
++    keys = download.list_game_keys(tier, year, limit)
++    amap = download.agent_map()
++    mmap = download.map_map()
++
++    session = get_session()
++    try:
++        existing = set(session.execute(select(VctGame.game_id)).scalars().all())
++        total = len(keys)
++        for i, key in enumerate(keys):
++            stats["scanned"] += 1
++            gid = key.rsplit("/", 1)[-1].replace(".json.gz", "")
++            if gid in existing:
++                stats["skipped"] += 1
++                if on_progress:
++                    on_progress(i, total, gid, "skip")
++                continue
++            try:
++                result = parse_game(download.fetch_game(key), amap, mmap)
++                if result is None or not result.players:
++                    stats["failed"] += 1
++                    if on_progress:
++                        on_progress(i, total, gid, "empty")
++                    continue
++
++                by_team: dict = {}
++                for p in result.players:
++                    by_team.setdefault(p.team_id, []).append(p.handle)
++                team_tags = {tid: _team_tag(hs) for tid, hs in by_team.items()}
++                tids = list(result.team_names.keys())
++
++                game = VctGame(
++                    game_id=result.game_id or gid, tier=tier, year=year,
++                    map_name=result.map_name, played_at=_parse_dt(result.date),
++                    total_rounds=result.total_rounds,
++                    team_a_tag=team_tags.get(tids[0]) if len(tids) > 0 else None,
++                    team_b_tag=team_tags.get(tids[1]) if len(tids) > 1 else None,
++                    winner_tag=team_tags.get(result.winner_team_id),
++                )
++                session.add(game)
++                for p in result.players:
++                    tag = team_tags.get(p.team_id)
++                    session.add(VctAbilityStat(
++                        game_id=game.game_id, handle=p.handle,
++                        player_name=_player_name(p.handle, tag), team_tag=tag,
++                        agent=p.agent, role=p.role, rounds=result.total_rounds,
++                        ability_casts=p.ability1_casts + p.ability2_casts + p.grenade_casts,
++                        ult_casts=p.ult_casts, kills=p.kills, deaths=p.deaths, won=p.won,
++                    ))
++                    stats["players"] += 1
++                session.commit()
++                existing.add(game.game_id)
++                stats["imported"] += 1
++                if on_progress:
++                    on_progress(i, total, gid, "ok")
++            except Exception:
++                session.rollback()
++                log.exception("VCT import failed for %s", gid)
++                stats["failed"] += 1
++                if on_progress:
++                    on_progress(i, total, gid, "error")
++            if delay:
++                time.sleep(delay)
++        return stats
++    finally:
++        session.close()
+diff --git a/src/vlr/vct/parse.py b/src/vlr/vct/parse.py
+new file mode 100644
+index 0000000..aa4b965
+--- /dev/null
++++ b/src/vlr/vct/parse.py
+@@ -0,0 +1,191 @@
++"""Parse one VCT game (an event stream) into per-player ability/ult usage.
++
++The game files are a time-ordered list of events; each event is a dict with
++`platformGameId`, `metadata`, and exactly one type body (`configuration`,
++`snapshot`, `playerDied`, `roundStarted`, `roundDecided`, ...).
++
++Ability usage is DERIVED from state snapshots: every snapshot carries each
++player's current charges per slot (GRENADE / ABILITY_1 / ABILITY_2 / ULTIMATE).
++When a slot's charge drops within a round, the player cast that ability. Ult
++points accumulate across rounds and only fall when the ultimate is fired, so
++ult casts are counted cleanly (ready -> spent). This is a state-diff proxy, not
++a discrete cast log — see the module docstring / methodology note in the UI.
++"""
++from __future__ import annotations
++
++from dataclasses import dataclass
++from typing import Optional
++
++_ABILITY_SLOTS = ("ABILITY_1", "ABILITY_2", "GRENADE")
++_ULT_SLOT = "ULTIMATE"
++
++
++@dataclass
++class PlayerAbilities:
++    player_id: int
++    handle: str = ""
++    agent: Optional[str] = None
++    role: Optional[str] = None
++    team_id: Optional[int] = None
++    team_name: str = ""
++    ability1_casts: int = 0
++    ability2_casts: int = 0
++    grenade_casts: int = 0
++    ult_casts: int = 0
++    kills: int = 0
++    deaths: int = 0
++    won: bool = False
++
++
++@dataclass
++class GameResult:
++    game_id: str
++    map_name: Optional[str]
++    date: Optional[str]
++    total_rounds: int
++    winner_team_id: Optional[int]
++    round_wins: dict            # team_id -> rounds won
++    team_names: dict            # team_id -> name
++    players: list               # list[PlayerAbilities]
++
++
++def _cur(ability: dict) -> int:
++    return (ability.get("baseCharges", 0) or 0) + (ability.get("temporaryCharges", 0) or 0)
++
++
++def _slot(ability: dict) -> Optional[str]:
++    fb = (ability.get("ability", {}) or {}).get("fallback", {}) or {}
++    return (fb.get("inventorySlot", {}) or {}).get("slot")
++
++
++def parse_game(events: list, agent_map: Optional[dict] = None,
++               map_map: Optional[dict] = None) -> Optional[GameResult]:
++    """Return a GameResult, or None if the stream has no usable configuration.
++
++    agent_map: {AGENT_GUID_UPPER: (name, role)}   (from valorant-api)
++    map_map:   {map_asset_path: display_name}       (from valorant-api)
++    """
++    agent_map = agent_map or {}
++    map_map = map_map or {}
++
++    game_id: Optional[str] = None
++    map_name: Optional[str] = None
++    date: Optional[str] = None
++    team_names: dict = {}
++    player_team: dict = {}
++    players: dict[int, PlayerAbilities] = {}
++
++    last_charge: dict = {}      # (player_id, slot) -> last current charge
++    ult_cost: dict = {}         # player_id -> ult max charges (points to fire)
++    round_active = False
++    total_rounds = 0
++    round_wins: dict = {}
++
++    for e in events:
++        if game_id is None and e.get("platformGameId"):
++            game_id = e["platformGameId"]
++        md = e.get("metadata")
++        if md and date is None and md.get("wallTime"):
++            date = md["wallTime"]
++
++        if "configuration" in e:
++            c = e["configuration"]
++            sm = (c.get("selectedMap", {}) or {}).get("fallback", {}) or {}
++            asset = sm.get("guid") or ""
++            map_name = map_map.get(asset) or sm.get("displayName") or map_name
++            for t in c.get("teams", []):
++                tid = (t.get("teamId", {}) or {}).get("value")
++                if tid is not None:
++                    team_names[tid] = t.get("name", team_names.get(tid, ""))
++                    for pv in t.get("playersInTeam", []):
++                        player_team[pv.get("value")] = tid
++            for p in c.get("players", []):
++                pid = (p.get("playerId", {}) or {}).get("value")
++                if pid is None:
++                    continue
++                pa = players.setdefault(pid, PlayerAbilities(player_id=pid))
++                pa.handle = p.get("displayName") or pa.handle
++                sa = (p.get("selectedAgent", {}) or {}).get("fallback", {}) or {}
++                resolved = agent_map.get((sa.get("guid") or "").upper())
++                if resolved:
++                    pa.agent, pa.role = resolved
++            continue
++
++        if "roundStarted" in e:
++            round_active = True
++            total_rounds = max(total_rounds, e["roundStarted"].get("roundNumber", total_rounds))
++            for key in list(last_charge):
++                if key[1] in _ABILITY_SLOTS:   # ult carries across rounds; re-baseline the rest
++                    last_charge[key] = None
++            continue
++
++        if "roundDecided" in e:
++            round_active = False
++            wt = ((e["roundDecided"].get("result", {}) or {}).get("winningTeam", {}) or {}).get("value")
++            if wt is not None:
++                round_wins[wt] = round_wins.get(wt, 0) + 1
++            continue
++
++        if "playerDied" in e:
++            pd = e["playerDied"]
++            dec = (pd.get("deceasedId", {}) or {}).get("value")
++            kil = (pd.get("killerId", {}) or {}).get("value")
++            if dec in players:
++                players[dec].deaths += 1
++            if kil is not None and kil in players and kil != dec:
++                players[kil].kills += 1
++            continue
++
++        if "snapshot" in e:
++            for p in e["snapshot"].get("players", []):
++                pid = (p.get("playerId", {}) or {}).get("value")
++                if pid is None:
++                    continue
++                pa = players.setdefault(pid, PlayerAbilities(player_id=pid))
++                for ab in p.get("abilities", []):
++                    slot = _slot(ab)
++                    if slot not in _ABILITY_SLOTS and slot != _ULT_SLOT:
++                        continue
++                    cur = _cur(ab)
++                    key = (pid, slot)
++                    prev = last_charge.get(key)
++                    if slot == _ULT_SLOT:
++                        mx = ab.get("maxCharges", 0) or 0
++                        if mx:
++                            ult_cost[pid] = mx
++                        if prev is not None and cur < prev:
++                            cost = ult_cost.get(pid, 0)
++                            if cost and prev >= cost:      # was ready -> fired
++                                pa.ult_casts += 1
++                        last_charge[key] = cur
++                    else:
++                        if prev is not None and round_active and cur < prev:
++                            amt = prev - cur
++                            if slot == "ABILITY_1":
++                                pa.ability1_casts += amt
++                            elif slot == "ABILITY_2":
++                                pa.ability2_casts += amt
++                            else:
++                                pa.grenade_casts += amt
++                        last_charge[key] = cur
++            continue
++
++    if not players:
++        return None
++
++    winner = max(round_wins, key=round_wins.get) if round_wins else None
++    for pa in players.values():
++        pa.team_id = player_team.get(pa.player_id)
++        pa.team_name = team_names.get(pa.team_id, "")
++        pa.won = winner is not None and pa.team_id == winner
++
++    return GameResult(
++        game_id=game_id or "",
++        map_name=map_name,
++        date=date,
++        total_rounds=total_rounds,
++        winner_team_id=winner,
++        round_wins=round_wins,
++        team_names=team_names,
++        players=list(players.values()),
++    )
+diff --git a/web/app/abilities/page.tsx b/web/app/abilities/page.tsx
+new file mode 100644
+index 0000000..53b11cf
+--- /dev/null
++++ b/web/app/abilities/page.tsx
+@@ -0,0 +1,258 @@
++'use client';
++
++import { useEffect, useMemo, useState } from 'react';
++import { motion } from 'framer-motion';
++import { Search, Zap, Activity } from 'lucide-react';
++import {
++  api,
++  type AbilitySummary,
++  type AbilityAgent,
++  type AbilityPlayer,
++} from '@/lib/api';
++import { Skeleton } from '@/components/ui/skeleton';
++import { cn } from '@/lib/utils';
++
++const ROLE_COLOR: Record<string, string> = {
++  Duelist: 'text-rose-400 border-rose-400/30 bg-rose-400/10',
++  Initiator: 'text-amber-400 border-amber-400/30 bg-amber-400/10',
++  Controller: 'text-violet-400 border-violet-400/30 bg-violet-400/10',
++  Sentinel: 'text-emerald-400 border-emerald-400/30 bg-emerald-400/10',
++};
++
++function RoleChip({ role }: { role: string | null }) {
++  if (!role) return <span className="text-ink-dim">—</span>;
++  return (
++    <span
++      className={cn(
++        'inline-flex px-2 py-0.5 rounded-md text-[0.7rem] font-medium border',
++        ROLE_COLOR[role] ?? 'text-ink-soft border-border bg-surface',
++      )}
++    >
++      {role}
++    </span>
++  );
++}
++
++type Tab = 'agents' | 'players';
++
++export default function AbilitiesPage() {
++  const [summary, setSummary] = useState<AbilitySummary | null>(null);
++  const [agents, setAgents] = useState<AbilityAgent[]>([]);
++  const [players, setPlayers] = useState<AbilityPlayer[]>([]);
++  const [tab, setTab] = useState<Tab>('agents');
++  const [search, setSearch] = useState('');
++  const [loading, setLoading] = useState(true);
++  const [failed, setFailed] = useState(false);
++
++  useEffect(() => {
++    Promise.all([
++      api.abilitiesSummary().catch(() => null),
++      api.abilitiesAgents(5).catch(() => [] as AbilityAgent[]),
++    ])
++      .then(([s, a]) => {
++        setSummary(s);
++        setAgents(a);
++        if (!s) setFailed(true);
++      })
++      .finally(() => setLoading(false));
++  }, []);
++
++  useEffect(() => {
++    if (tab !== 'players') return;
++    api.abilitiesPlayers(search, 60).then(setPlayers).catch(() => setPlayers([]));
++  }, [tab, search]);
++
++  const hasData = !!summary && summary.games > 0;
++  const yearLabel = useMemo(() => {
++    if (!summary?.year_min) return '';
++    return summary.year_min === summary.year_max
++      ? `${summary.year_min}`
++      : `${summary.year_min}–${summary.year_max}`;
++  }, [summary]);
++
++  return (
++    <div className="max-w-7xl mx-auto px-6 lg:px-8 py-16">
++      {/* Hero */}
++      <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }}>
++        <div className="flex items-center gap-2 text-[0.7rem] font-medium uppercase tracking-widest text-ink-dim mb-3">
++          <Zap className="w-3.5 h-3.5 text-accent" />
++          Ability analysis · VCT esports telemetry
++        </div>
++        <h1 className="text-display font-semibold tracking-tight text-gradient">
++          What the utility actually did.
++        </h1>
++        <p className="mt-4 text-base text-ink-soft max-w-2xl">
++          Measured ability and ultimate usage from real VCT matches
++          {yearLabel && ` (${yearLabel})`} — Riot game telemetry, not inferred
++          from agent picks. This is a historical corpus, separate from the live
++          vlr data.
++        </p>
++      </motion.div>
++
++      {/* Coverage tiles */}
++      <motion.div
++        initial={{ opacity: 0 }}
++        animate={{ opacity: 1 }}
++        transition={{ delay: 0.12 }}
++        className="mt-8 grid grid-cols-2 md:grid-cols-4 gap-3"
++      >
++        {[
++          { label: 'Games', value: summary?.games },
++          { label: 'Players', value: summary?.players },
++          { label: 'Agents', value: summary?.agents },
++          { label: 'Seasons', value: yearLabel || '—' },
++        ].map((t) => (
++          <div key={t.label} className="bg-surface border border-border rounded-2xl p-4">
++            <div className="text-[0.65rem] uppercase tracking-widest text-ink-dim mb-1">
++              {t.label}
++            </div>
++            <div className="font-mono text-2xl font-semibold text-ink tabular">
++              {loading ? '…' : (t.value ?? 0)}
++            </div>
++          </div>
++        ))}
++      </motion.div>
++
++      {/* Empty / offline state */}
++      {!loading && !hasData && (
++        <div className="mt-8 bg-surface border border-border rounded-2xl p-8 text-center">
++          <Activity className="w-6 h-6 text-ink-dim mx-auto mb-3" />
++          <div className="text-ink font-medium mb-1">
++            {failed ? 'Ability data unavailable' : 'No VCT ability data imported yet'}
++          </div>
++          <p className="text-sm text-ink-soft max-w-md mx-auto">
++            Populate it once from Riot&apos;s public VCT dataset:
++          </p>
++          <code className="mt-3 inline-block bg-bg border border-border rounded-lg px-3 py-2 text-xs text-ink-soft font-mono">
++            python -m src.vlr.cli import-vct-abilities --tier vct-international --year 2024
++          </code>
++        </div>
++      )}
++
++      {hasData && (
++        <>
++          {/* Tabs + search */}
++          <motion.div
++            initial={{ opacity: 0 }}
++            animate={{ opacity: 1 }}
++            transition={{ delay: 0.2 }}
++            className="mt-10 flex flex-wrap items-center justify-between gap-4"
++          >
++            <div className="flex gap-1 p-1 bg-surface border border-border rounded-xl">
++              {(['agents', 'players'] as Tab[]).map((t) => (
++                <button
++                  key={t}
++                  onClick={() => setTab(t)}
++                  className={cn(
++                    'px-4 py-1.5 text-sm font-medium rounded-lg transition-all capitalize',
++                    tab === t
++                      ? 'bg-accent text-white shadow-lg shadow-accent/20'
++                      : 'text-ink-soft hover:text-ink hover:bg-surface-hover',
++                  )}
++                >
++                  {t === 'agents' ? 'By Agent' : 'Players'}
++                </button>
++              ))}
++            </div>
++            {tab === 'players' && (
++              <div className="relative">
++                <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-ink-dim" />
++                <input
++                  value={search}
++                  onChange={(e) => setSearch(e.target.value)}
++                  placeholder="Search players…"
++                  className="pl-9 pr-4 py-2 bg-surface border border-border rounded-lg text-sm text-ink placeholder:text-ink-dim focus:outline-none focus:border-border-strong w-64"
++                />
++              </div>
++            )}
++          </motion.div>
++
++          {/* Table */}
++          <motion.div
++            initial={{ opacity: 0, y: 16 }}
++            animate={{ opacity: 1, y: 0 }}
++            transition={{ delay: 0.28 }}
++            className="mt-6 bg-surface border border-border rounded-2xl overflow-x-auto"
++          >
++            {tab === 'agents' ? (
++              <table className="w-full min-w-[720px] text-sm">
++                <thead>
++                  <tr className="border-b border-border text-[0.65rem] uppercase tracking-widest text-ink-dim">
++                    <th className="text-left font-medium px-5 py-3">Agent</th>
++                    <th className="text-left font-medium px-5 py-3">Role</th>
++                    <th className="text-right font-medium px-5 py-3">Games</th>
++                    <th className="text-right font-medium px-5 py-3">Utility / round</th>
++                    <th className="text-right font-medium px-5 py-3">Ults / game</th>
++                    <th className="text-right font-medium px-5 py-3">K/D</th>
++                    <th className="text-right font-medium px-5 py-3">Win %</th>
++                  </tr>
++                </thead>
++                <tbody>
++                  {agents.map((a) => (
++                    <tr key={a.agent} className="border-b border-border last:border-0 hover:bg-bg/20">
++                      <td className="px-5 py-3 font-semibold text-ink">{a.agent}</td>
++                      <td className="px-5 py-3"><RoleChip role={a.role} /></td>
++                      <td className="px-5 py-3 text-right font-mono tabular text-ink-soft">{a.games}</td>
++                      <td className="px-5 py-3 text-right font-mono tabular text-ink">
++                        <span className="text-accent font-semibold">{a.ability_casts_per_round}</span>
++                      </td>
++                      <td className="px-5 py-3 text-right font-mono tabular text-ink-soft">{a.ults_per_game}</td>
++                      <td className="px-5 py-3 text-right font-mono tabular text-ink-soft">{a.kd}</td>
++                      <td className="px-5 py-3 text-right font-mono tabular text-ink-soft">{a.win_rate}%</td>
++                    </tr>
++                  ))}
++                </tbody>
++              </table>
++            ) : (
++              <table className="w-full min-w-[680px] text-sm">
++                <thead>
++                  <tr className="border-b border-border text-[0.65rem] uppercase tracking-widest text-ink-dim">
++                    <th className="text-left font-medium px-5 py-3">Player</th>
++                    <th className="text-left font-medium px-5 py-3">Team</th>
++                    <th className="text-right font-medium px-5 py-3">Games</th>
++                    <th className="text-right font-medium px-5 py-3">Utility / round</th>
++                    <th className="text-right font-medium px-5 py-3">Ults / game</th>
++                    <th className="text-right font-medium px-5 py-3">K/D</th>
++                    <th className="text-right font-medium px-5 py-3">Win %</th>
++                  </tr>
++                </thead>
++                <tbody>
++                  {players.length === 0 && (
++                    <tr>
++                      <td colSpan={7} className="px-5 py-10 text-center text-ink-dim">
++                        No players match.
++                      </td>
++                    </tr>
++                  )}
++                  {players.map((p) => (
++                    <tr key={p.player_name} className="border-b border-border last:border-0 hover:bg-bg/20">
++                      <td className="px-5 py-3 font-semibold text-ink">{p.player_name}</td>
++                      <td className="px-5 py-3 text-ink-dim">{p.team_tag ?? '—'}</td>
++                      <td className="px-5 py-3 text-right font-mono tabular text-ink-soft">{p.games}</td>
++                      <td className="px-5 py-3 text-right font-mono tabular text-accent font-semibold">
++                        {p.ability_casts_per_round}
++                      </td>
++                      <td className="px-5 py-3 text-right font-mono tabular text-ink-soft">{p.ults_per_game}</td>
++                      <td className="px-5 py-3 text-right font-mono tabular text-ink-soft">{p.kd}</td>
++                      <td className="px-5 py-3 text-right font-mono tabular text-ink-soft">{p.win_rate}%</td>
++                    </tr>
++                  ))}
++                </tbody>
++              </table>
++            )}
++          </motion.div>
++        </>
++      )}
++
++      {/* Methodology footnote */}
++      <div className="mt-6 text-xs text-ink-dim max-w-3xl leading-relaxed">
++        <span className="font-medium text-ink-soft">Methodology:</span> ability
++        usage is derived from Riot&apos;s per-tick state telemetry — a cast is
++        counted when a player&apos;s ability charge drops within a round;
++        ultimates are counted when a ready ult is spent. &quot;Utility / round&quot;
++        combines the two non-grenade ability slots. Agents resolve via
++        valorant-api. Data: Riot VCT esports dataset (2022–2024), historical.
++      </div>
++    </div>
++  );
++}
+diff --git a/web/components/layout/nav.tsx b/web/components/layout/nav.tsx
+index 2ec6144..983579e 100644
+--- a/web/components/layout/nav.tsx
++++ b/web/components/layout/nav.tsx
+@@ -14,6 +14,7 @@ const navItems = [
+   { href: '/fantasy', label: 'Fantasy' },
+   { href: '/pickem', label: "Pick'em" },
+   { href: '/meta', label: 'Meta' },
++  { href: '/abilities', label: 'Abilities' },
+   { href: '/compare', label: 'Compare' },
+   { href: '/depth', label: 'Depth' },
+   { href: '/teams', label: 'Teams' },
+diff --git a/web/lib/api.ts b/web/lib/api.ts
+index f7e404e..c825a22 100644
+--- a/web/lib/api.ts
++++ b/web/lib/api.ts
+@@ -309,6 +309,39 @@ export interface LeaderboardTeam extends RegionalTeam {
+   }[];
+ }
+ 
++// VCT ability telemetry (historical 2022-24 module)
++export interface AbilitySummary {
++  games: number;
++  players: number;
++  agents: number;
++  year_min: number | null;
++  year_max: number | null;
++  tiers: string[];
++}
++
++export interface AbilityAgent {
++  agent: string;
++  role: string | null;
++  games: number;
++  ability_casts_per_round: number;
++  ults_per_game: number;
++  ult_per_round: number;
++  kd: number;
++  win_rate: number;
++}
++
++export interface AbilityPlayer {
++  player_name: string;
++  team_tag: string | null;
++  games: number;
++  ability_casts_per_round: number;
++  ults_per_game: number;
++  kd: number;
++  win_rate: number;
++  found?: boolean;
++  agents?: { agent: string; games: number; ults: number }[];
++}
++
+ // --- API methods --------------------------------------------------------
+ 
+ export const api = {
+@@ -394,4 +427,15 @@ export const api = {
+     request<EventPlayer[]>(`/api/v1/depth/events/${eventId}/players`),
+   playerEventAnalysis: (eventId: number, playerId: number) =>
+     request<PlayerEventAnalysis>(`/api/v1/depth/events/${eventId}/players/${playerId}`),
++
++  // VCT ability telemetry (historical 2022-24)
++  abilitiesSummary: () => request<AbilitySummary>('/api/v1/abilities/summary'),
++  abilitiesAgents: (minGames = 5) =>
++    request<AbilityAgent[]>(`/api/v1/abilities/agents?min_games=${minGames}`),
++  abilitiesPlayers: (search = '', limit = 50) =>
++    request<AbilityPlayer[]>(
++      `/api/v1/abilities/players?search=${encodeURIComponent(search)}&limit=${limit}`,
++    ),
++  abilitiesPlayer: (name: string) =>
++    request<AbilityPlayer>(`/api/v1/abilities/players/${encodeURIComponent(name)}`),
+ };

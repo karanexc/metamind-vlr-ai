@@ -68,6 +68,33 @@ def init_db_cmd() -> None:
     """
     _configure_logging(verbose=False)
     _init_db()
+
+
+@app.command("import-vct-abilities")
+def import_vct_abilities_cmd(
+    tier: str = typer.Option(
+        "vct-international",
+        help="game-changers | vct-challengers | vct-international",
+    ),
+    year: int = typer.Option(2024, help="2022, 2023 or 2024"),
+    limit: Optional[int] = typer.Option(None, help="max games to import (subset)"),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
+    """Import Riot's VCT esports telemetry -> derived ability/ult usage (2022-24).
+
+    Historical, one-time (idempotent) import — separate from the live scrape.
+    Run `init-db` first so the vct_* tables exist. Example:
+        python -m src.vlr.cli import-vct-abilities --tier vct-international --year 2024 --limit 150
+    """
+    _configure_logging(verbose)
+    from .vct.loader import import_vct_games
+
+    def _prog(i: int, total: int, gid: str, status: str) -> None:
+        if status in ("ok", "error", "empty") or i % 25 == 0:
+            console.print(f"[{i + 1}/{total}] {gid[:22]} -> {status}")
+
+    result = import_vct_games(tier, year, limit=limit, on_progress=_prog)
+    console.print(f"[bold green]VCT import done[/]: {result}")
     console.print("[green]Schema created and migrations applied.[/green]")
 
     # Check whether tier classifications are missing — common after a 7b upgrade

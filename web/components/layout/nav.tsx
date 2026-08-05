@@ -14,6 +14,7 @@ const navItems = [
   { href: '/fantasy', label: 'Fantasy' },
   { href: '/pickem', label: "Pick'em" },
   { href: '/meta', label: 'Meta' },
+  { href: '/abilities', label: 'Abilities' },
   { href: '/compare', label: 'Compare' },
   { href: '/depth', label: 'Depth' },
   { href: '/teams', label: 'Teams' },
