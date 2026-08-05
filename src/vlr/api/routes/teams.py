@@ -13,9 +13,27 @@ router = APIRouter()
 @router.get("/teams", response_model=list[TeamListItem])
 async def list_teams(min_matches: int = Query(5, ge=1, le=100)) -> list[TeamListItem]:
     """List all teams that have played at least `min_matches` matches."""
+    opts = data.get_team_options(min_matches=min_matches)
+    # Attach logos in one extra query, without changing the shared
+    # get_team_options() signature (used by the Streamlit app + pickem).
+    logos: dict[int, str] = {}
+    ids = [tid for tid, _, _ in opts]
+    if ids:
+        from vlr.db.session import get_session
+        from vlr.db.models import Team
+        from sqlalchemy import select as _select
+        session = get_session()
+        try:
+            for tid, logo in session.execute(
+                _select(Team.id, Team.logo_url).where(Team.id.in_(ids))
+            ).all():
+                if logo:
+                    logos[int(tid)] = logo
+        finally:
+            session.close()
     return [
-        TeamListItem(id=tid, name=name, n_matches=n)
-        for tid, name, n in data.get_team_options(min_matches=min_matches)
+        TeamListItem(id=tid, name=name, n_matches=n, logo_url=logos.get(tid))
+        for tid, name, n in opts
     ]
 
 

@@ -45,6 +45,8 @@ async def get_player(player_id: int) -> PlayerSummary:
     return PlayerSummary(
         id=player_id,
         name=summary["name"],
+        image_url=summary.get("image_url"),
+        country=summary.get("country"),
         n_maps=summary["n_maps"],
         avg_rating=summary["avg_rating"],
         avg_acs=summary["avg_acs"],

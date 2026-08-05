@@ -10,7 +10,8 @@ import { api, type PlayerListItem, type PlayerSummary } from '@/lib/api';
 import { SAMPLE_PLAYER_LIST, SAMPLE_PLAYER_SUMMARIES } from '@/lib/sample-players';
 import { Select } from '@/components/ui/select';
 import { Skeleton } from '@/components/ui/skeleton';
-import { cn } from '@/lib/utils';
+import { PlayerAvatar } from '@/components/ui/avatar';
+import { cn, countryFlag } from '@/lib/utils';
 
 // Per-metric domain maxima used to normalise onto the 0–100 radar.
 const AXES: { key: string; label: string; max: number; fmt: (s: PlayerSummary) => number }[] = [
@@ -122,7 +123,15 @@ export default function ComparePage() {
             <span className="text-[0.7rem] font-medium uppercase tracking-widest text-ink-dim">Player A</span>
           </div>
           <Select options={options} value={idA} onChange={(v) => setIdA(Number(v))} placeholder="Pick a player..." />
-          {sumA && <div className="mt-3 text-lg font-semibold text-ink">{sumA.name}</div>}
+          {sumA && (
+            <div className="mt-3 flex items-center gap-3">
+              <PlayerAvatar name={sumA.name} imageUrl={sumA.image_url} country={sumA.country} size="md" />
+              <div className="text-lg font-semibold text-ink flex items-center gap-1.5">
+                {sumA.name}
+                {countryFlag(sumA.country) && <span className="text-sm leading-none">{countryFlag(sumA.country)}</span>}
+              </div>
+            </div>
+          )}
         </div>
         <div className="bg-surface border border-border rounded-2xl p-5">
           <div className="flex items-center gap-2 mb-3">
@@ -130,7 +139,15 @@ export default function ComparePage() {
             <span className="text-[0.7rem] font-medium uppercase tracking-widest text-ink-dim">Player B</span>
           </div>
           <Select options={options} value={idB} onChange={(v) => setIdB(Number(v))} placeholder="Pick a player..." />
-          {sumB && <div className="mt-3 text-lg font-semibold text-ink">{sumB.name}</div>}
+          {sumB && (
+            <div className="mt-3 flex items-center gap-3">
+              <PlayerAvatar name={sumB.name} imageUrl={sumB.image_url} country={sumB.country} size="md" />
+              <div className="text-lg font-semibold text-ink flex items-center gap-1.5">
+                {sumB.name}
+                {countryFlag(sumB.country) && <span className="text-sm leading-none">{countryFlag(sumB.country)}</span>}
+              </div>
+            </div>
+          )}
         </div>
       </div>
 

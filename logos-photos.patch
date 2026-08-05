@@ -1,0 +1,163 @@
+diff --git a/src/vlr/api/routes/players.py b/src/vlr/api/routes/players.py
+index 9e3706d..510dfa5 100644
+--- a/src/vlr/api/routes/players.py
++++ b/src/vlr/api/routes/players.py
+@@ -45,6 +45,8 @@ async def get_player(player_id: int) -> PlayerSummary:
+     return PlayerSummary(
+         id=player_id,
+         name=summary["name"],
++        image_url=summary.get("image_url"),
++        country=summary.get("country"),
+         n_maps=summary["n_maps"],
+         avg_rating=summary["avg_rating"],
+         avg_acs=summary["avg_acs"],
+diff --git a/src/vlr/api/routes/teams.py b/src/vlr/api/routes/teams.py
+index b1c0547..970a323 100644
+--- a/src/vlr/api/routes/teams.py
++++ b/src/vlr/api/routes/teams.py
+@@ -13,9 +13,27 @@ router = APIRouter()
+ @router.get("/teams", response_model=list[TeamListItem])
+ async def list_teams(min_matches: int = Query(5, ge=1, le=100)) -> list[TeamListItem]:
+     """List all teams that have played at least `min_matches` matches."""
++    opts = data.get_team_options(min_matches=min_matches)
++    # Attach logos in one extra query, without changing the shared
++    # get_team_options() signature (used by the Streamlit app + pickem).
++    logos: dict[int, str] = {}
++    ids = [tid for tid, _, _ in opts]
++    if ids:
++        from vlr.db.session import get_session
++        from vlr.db.models import Team
++        from sqlalchemy import select as _select
++        session = get_session()
++        try:
++            for tid, logo in session.execute(
++                _select(Team.id, Team.logo_url).where(Team.id.in_(ids))
++            ).all():
++                if logo:
++                    logos[int(tid)] = logo
++        finally:
++            session.close()
+     return [
+-        TeamListItem(id=tid, name=name, n_matches=n)
+-        for tid, name, n in data.get_team_options(min_matches=min_matches)
++        TeamListItem(id=tid, name=name, n_matches=n, logo_url=logos.get(tid))
++        for tid, name, n in opts
+     ]
+ 
+ 
+diff --git a/src/vlr/api/schemas.py b/src/vlr/api/schemas.py
+index 1b79488..3df3bea 100644
+--- a/src/vlr/api/schemas.py
++++ b/src/vlr/api/schemas.py
+@@ -33,6 +33,7 @@ class TeamListItem(BaseModel):
+     id: int
+     name: str
+     n_matches: int
++    logo_url: Optional[str] = None
+ 
+ 
+ class TeamSummary(BaseModel):
+@@ -61,6 +62,8 @@ class PlayerListItem(BaseModel):
+ class PlayerSummary(BaseModel):
+     id: int
+     name: str
++    image_url: Optional[str] = None
++    country: Optional[str] = None
+     n_maps: int
+     avg_rating: float
+     avg_acs: float
+diff --git a/src/vlr/app/data.py b/src/vlr/app/data.py
+index cee6265..a71d512 100644
+--- a/src/vlr/app/data.py
++++ b/src/vlr/app/data.py
+@@ -555,6 +555,8 @@ def get_player_summary(player_id: int) -> Optional[dict]:
+ 
+         return {
+             "name": player.name,
++            "image_url": player.image_url,
++            "country": player.country,
+             "n_maps": career[0] if career else 0,
+             "avg_rating": round(career[1], 2) if career and career[1] else 0,
+             "avg_acs": round(career[2], 0) if career and career[2] else 0,
+diff --git a/web/app/compare/page.tsx b/web/app/compare/page.tsx
+index 085c8ee..36cc84c 100644
+--- a/web/app/compare/page.tsx
++++ b/web/app/compare/page.tsx
+@@ -10,7 +10,8 @@ import { api, type PlayerListItem, type PlayerSummary } from '@/lib/api';
+ import { SAMPLE_PLAYER_LIST, SAMPLE_PLAYER_SUMMARIES } from '@/lib/sample-players';
+ import { Select } from '@/components/ui/select';
+ import { Skeleton } from '@/components/ui/skeleton';
+-import { cn } from '@/lib/utils';
++import { PlayerAvatar } from '@/components/ui/avatar';
++import { cn, countryFlag } from '@/lib/utils';
+ 
+ // Per-metric domain maxima used to normalise onto the 0–100 radar.
+ const AXES: { key: string; label: string; max: number; fmt: (s: PlayerSummary) => number }[] = [
+@@ -122,7 +123,15 @@ export default function ComparePage() {
+             <span className="text-[0.7rem] font-medium uppercase tracking-widest text-ink-dim">Player A</span>
+           </div>
+           <Select options={options} value={idA} onChange={(v) => setIdA(Number(v))} placeholder="Pick a player..." />
+-          {sumA && <div className="mt-3 text-lg font-semibold text-ink">{sumA.name}</div>}
++          {sumA && (
++            <div className="mt-3 flex items-center gap-3">
++              <PlayerAvatar name={sumA.name} imageUrl={sumA.image_url} country={sumA.country} size="md" />
++              <div className="text-lg font-semibold text-ink flex items-center gap-1.5">
++                {sumA.name}
++                {countryFlag(sumA.country) && <span className="text-sm leading-none">{countryFlag(sumA.country)}</span>}
++              </div>
++            </div>
++          )}
+         </div>
+         <div className="bg-surface border border-border rounded-2xl p-5">
+           <div className="flex items-center gap-2 mb-3">
+@@ -130,7 +139,15 @@ export default function ComparePage() {
+             <span className="text-[0.7rem] font-medium uppercase tracking-widest text-ink-dim">Player B</span>
+           </div>
+           <Select options={options} value={idB} onChange={(v) => setIdB(Number(v))} placeholder="Pick a player..." />
+-          {sumB && <div className="mt-3 text-lg font-semibold text-ink">{sumB.name}</div>}
++          {sumB && (
++            <div className="mt-3 flex items-center gap-3">
++              <PlayerAvatar name={sumB.name} imageUrl={sumB.image_url} country={sumB.country} size="md" />
++              <div className="text-lg font-semibold text-ink flex items-center gap-1.5">
++                {sumB.name}
++                {countryFlag(sumB.country) && <span className="text-sm leading-none">{countryFlag(sumB.country)}</span>}
++              </div>
++            </div>
++          )}
+         </div>
+       </div>
+ 
+diff --git a/web/app/fantasy/page.tsx b/web/app/fantasy/page.tsx
+index 78af835..11a71ab 100644
+--- a/web/app/fantasy/page.tsx
++++ b/web/app/fantasy/page.tsx
+@@ -269,7 +269,7 @@ export default function FantasyPage() {
+ 
+           {challengeTeam && (
+             <div className="mt-4 flex items-center gap-3 px-3 py-2.5 bg-accent/5 border border-accent/20 rounded-lg">
+-              <TeamLogo name={challengeTeam.name} size="md" />
++              <TeamLogo name={challengeTeam.name} logoUrl={challengeTeam.logo_url} size="md" />
+               <div className="min-w-0">
+                 <div className="text-sm font-semibold text-ink truncate">{challengeTeam.name}</div>
+                 <div className="text-[0.65rem] uppercase tracking-widest text-ink-dim">
+diff --git a/web/lib/api.ts b/web/lib/api.ts
+index d7fd1eb..6d68216 100644
+--- a/web/lib/api.ts
++++ b/web/lib/api.ts
+@@ -57,6 +57,7 @@ export interface TeamListItem {
+   id: number;
+   name: string;
+   n_matches: number;
++  logo_url?: string | null;
+ }
+ 
+ export interface TeamSummary {
+@@ -82,6 +83,8 @@ export interface PlayerListItem {
+ export interface PlayerSummary {
+   id: number;
+   name: string;
++  image_url?: string | null;
++  country?: string | null;
+   n_maps: number;
+   avg_rating: number;
+   avg_acs: number;

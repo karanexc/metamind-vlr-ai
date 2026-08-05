@@ -33,6 +33,7 @@ class TeamListItem(BaseModel):
     id: int
     name: str
     n_matches: int
+    logo_url: Optional[str] = None
 
 
 class TeamSummary(BaseModel):
@@ -61,6 +62,8 @@ class PlayerListItem(BaseModel):
 class PlayerSummary(BaseModel):
     id: int
     name: str
+    image_url: Optional[str] = None
+    country: Optional[str] = None
     n_maps: int
     avg_rating: float
     avg_acs: float

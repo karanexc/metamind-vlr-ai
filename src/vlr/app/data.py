@@ -555,6 +555,8 @@ def get_player_summary(player_id: int) -> Optional[dict]:
 
         return {
             "name": player.name,
+            "image_url": player.image_url,
+            "country": player.country,
             "n_maps": career[0] if career else 0,
             "avg_rating": round(career[1], 2) if career and career[1] else 0,
             "avg_acs": round(career[2], 0) if career and career[2] else 0,

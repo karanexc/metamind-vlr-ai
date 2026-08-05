@@ -57,6 +57,7 @@ export interface TeamListItem {
   id: number;
   name: string;
   n_matches: number;
+  logo_url?: string | null;
 }
 
 export interface TeamSummary {
@@ -82,6 +83,8 @@ export interface PlayerListItem {
 export interface PlayerSummary {
   id: number;
   name: string;
+  image_url?: string | null;
+  country?: string | null;
   n_maps: number;
   avg_rating: number;
   avg_acs: number;

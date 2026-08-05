@@ -269,7 +269,7 @@ export default function FantasyPage() {
 
           {challengeTeam && (
             <div className="mt-4 flex items-center gap-3 px-3 py-2.5 bg-accent/5 border border-accent/20 rounded-lg">
-              <TeamLogo name={challengeTeam.name} size="md" />
+              <TeamLogo name={challengeTeam.name} logoUrl={challengeTeam.logo_url} size="md" />
               <div className="min-w-0">
                 <div className="text-sm font-semibold text-ink truncate">{challengeTeam.name}</div>
                 <div className="text-[0.65rem] uppercase tracking-widest text-ink-dim">
