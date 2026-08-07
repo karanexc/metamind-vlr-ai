@@ -1,0 +1,23 @@
+name: Refresh vlr data
+
+# Free "scheduler" for a sleeping free backend: every 2 hours this pings the
+# refresh endpoint, which wakes the host AND triggers a full refresh that writes
+# to the DB. Set LIVE_SCRAPE_ENABLED=false on the backend so the in-process
+# scheduler doesn't double up. Add a repo secret BACKEND_URL = your backend URL.
+
+on:
+  schedule:
+    - cron: "0 */2 * * *"   # every 2 hours (UTC); GitHub may delay under load
+  workflow_dispatch: {}     # lets you trigger it manually from the Actions tab
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger refresh
+        run: |
+          echo "Pinging refresh endpoint..."
+          # --max-time is generous so a cold start has time to wake.
+          curl -fsS --max-time 120 -X POST \
+            "${{ secrets.BACKEND_URL }}/api/v1/live/refresh" || \
+            echo "Ping returned non-zero (likely a cold-start timeout) — the wake + refresh still kicked off server-side."
