@@ -295,6 +295,10 @@ class VctRound(Base):
     is_pistol: Mapped[bool] = mapped_column(default=False)
     is_map_point: Mapped[bool] = mapped_column(default=False)
     is_clutch: Mapped[bool] = mapped_column(default=False)
+    # Agent that got the round's opening kill (first-blood impact).
+    opening_kill_agent: Mapped[Optional[str]] = mapped_column(String(64))
+    # Ultimates used this round with outcome: [{"agent": str, "won": bool}] (ult conversion).
+    ult_agents: Mapped[Optional[dict]] = mapped_column(JSONB)
     # Compact timeline: [{"t": sec_into_round, "k": ability|ult|kill|plant|defuse, "team": 0|1, "slot"?}]
     timeline: Mapped[Optional[dict]] = mapped_column(JSONB)
 

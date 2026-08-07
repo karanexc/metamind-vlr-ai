@@ -10,7 +10,7 @@ import { Search, Zap, Target, Crosshair, Shield } from 'lucide-react';
 import {
   api,
   type AbilitySummary, type AbilityAgent, type AbilityPlayer,
-  type AbilityImpact, type MapImpact, type VctGameListItem, type VctGameRounds,
+  type AbilityImpact, type MapImpact, type VctGameListItem, type VctGameRounds, type AbilityBreakdown,
   type VctRoundDetail, type VctTimelineEvent,
 } from '@/lib/api';
 import { cn } from '@/lib/utils';
@@ -90,6 +90,7 @@ function RoundTimeline({ round, teamA, teamB }: { round: VctRoundDetail; teamA: 
 export default function AbilitiesPage() {
   const [summary, setSummary] = useState<AbilitySummary | null>(null);
   const [impact, setImpact] = useState<AbilityImpact | null>(null);
+  const [breakdown, setBreakdown] = useState<AbilityBreakdown | null>(null);
   const [mapImpact, setMapImpact] = useState<MapImpact[]>([]);
   const [agents, setAgents] = useState<AbilityAgent[]>([]);
   const [players, setPlayers] = useState<AbilityPlayer[]>([]);
@@ -108,10 +109,12 @@ export default function AbilitiesPage() {
     Promise.all([
       api.abilitiesSummary().catch(() => null),
       api.abilitiesImpactMaps().catch(() => [] as MapImpact[]),
+      api.abilitiesImpactBreakdown().catch(() => null),
     ])
-      .then(([s, m]) => {
+      .then(([s, m, b]) => {
         setSummary(s);
         setMapImpact(m);
+        setBreakdown(b);
       })
       .finally(() => setLoading(false));
   }, []);
@@ -195,6 +198,11 @@ export default function AbilitiesPage() {
             className="mt-8 grid grid-cols-2 md:grid-cols-4 gap-3"
           >
             <StatCard
+              label="First blood → round win"
+              value={impact ? `${impact.first_blood_win_rate}%` : '—'}
+              sub="win the opening duel, win the round"
+            />
+            <StatCard
               label="Higher-utility team wins"
               value={impact ? `${impact.utility_edge_win_rate}%` : '—'}
               sub="of rounds where one side out-utilities the other"
@@ -205,7 +213,6 @@ export default function AbilitiesPage() {
               sub="when one team ults and the other doesn't"
             />
             <StatCard label="Rounds analysed" value={impact ? impact.rounds.toLocaleString() : '—'} />
-            <StatCard label="Games · agents" value={`${summary?.games ?? 0} · ${summary?.agents ?? 0}`} />
           </motion.div>
 
           {/* Map filter + tabs */}
@@ -245,6 +252,42 @@ export default function AbilitiesPage() {
           {/* IMPACT TAB */}
           {tab === 'impact' && (
             <motion.div initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} className="mt-6 space-y-4">
+              {/* High-signal per-agent impact */}
+              <div className="grid md:grid-cols-2 gap-4">
+                <div className="bg-surface border border-border rounded-2xl p-4">
+                  <div className="text-sm font-semibold text-ink">Opening duel — who wins the entry</div>
+                  <div className="text-[0.7rem] text-ink-dim mb-3">round win% when this agent draws first blood · ranked by volume</div>
+                  <div className="space-y-1.5">
+                    {(breakdown?.first_blood ?? []).slice(0, 8).map((a) => (
+                      <RankBar key={a.agent} label={a.agent} pct={a.win_pct} sub={`${a.first_bloods} FBs`} />
+                    ))}
+                    {(!breakdown || breakdown.first_blood.length === 0) && <EmptyRow />}
+                  </div>
+                </div>
+                <div className="bg-surface border border-border rounded-2xl p-4">
+                  <div className="text-sm font-semibold text-ink">Ult conversion — which ults swing rounds</div>
+                  <div className="text-[0.7rem] text-ink-dim mb-3">round win% when this agent spends their ultimate</div>
+                  <div className="space-y-1.5">
+                    {(breakdown?.ult_conversion ?? []).slice(0, 8).map((a) => (
+                      <RankBar key={a.agent} label={a.agent} pct={a.win_pct} sub={`${a.ult_rounds} ults`} />
+                    ))}
+                    {(!breakdown || breakdown.ult_conversion.length === 0) && <EmptyRow />}
+                  </div>
+                </div>
+              </div>
+
+              {/* Composition meta */}
+              <div className="bg-surface border border-border rounded-2xl p-4">
+                <div className="text-sm font-semibold text-ink">Composition — win% by role make-up</div>
+                <div className="text-[0.7rem] text-ink-dim mb-3">the comp meta: how a team&apos;s role split affects winning</div>
+                <div className="space-y-1.5">
+                  {(breakdown?.role_comps ?? []).slice(0, 6).map((c) => (
+                    <RankBar key={c.label} label={c.label} pct={c.win_pct} sub={`${c.games} games`} wide />
+                  ))}
+                  {(!breakdown || breakdown.role_comps.length === 0) && <EmptyRow />}
+                </div>
+              </div>
+
               <ChartCard
                 title="The meta map"
                 subtitle="utility per round × win rate · bubble = games · colour = role"
@@ -620,4 +663,21 @@ function Highlight({ label, name, sub }: { label: string; name?: string | null; 
       {sub && <div className="text-[0.65rem] text-ink-dim truncate">{sub}</div>}
     </div>
   );
+}
+
+function RankBar({ label, pct, sub, wide }: { label: string; pct: number; sub?: string; wide?: boolean }) {
+  return (
+    <div className="flex items-center gap-3 text-xs">
+      <div className={cn('text-ink truncate', wide ? 'w-40 md:w-56' : 'w-20')} title={label}>{label}</div>
+      <div className="flex-1 h-4 bg-bg rounded-full overflow-hidden">
+        <div className="h-full rounded-full transition-all" style={{ width: `${Math.min(100, Math.max(0, pct))}%`, background: pct >= 50 ? ACCENT : '#52525b' }} />
+      </div>
+      <div className="w-10 text-right font-mono tabular text-ink font-semibold">{pct}%</div>
+      {sub && <div className="w-16 text-right text-ink-dim tabular">{sub}</div>}
+    </div>
+  );
+}
+
+function EmptyRow() {
+  return <div className="text-xs text-ink-dim py-3 text-center">Not enough data yet — import more games.</div>;
 }

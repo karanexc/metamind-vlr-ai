@@ -349,6 +349,7 @@ export interface AbilityImpact {
   rounds: number;
   utility_edge_win_rate: number;
   ult_win_rate: number;
+  first_blood_win_rate: number;
   util_diff_buckets: { bucket: string; n: number; win_rate: number }[];
   ult_buckets: { ults: string; n: number; win_rate: number }[];
   by_condition: { condition: string; rounds: number; avg_util: number; avg_ults: number }[];
@@ -361,6 +362,12 @@ export interface MapImpact {
   utility_edge_win_rate: number;
   ult_win_rate: number;
   avg_util_per_round: number;
+}
+
+export interface AbilityBreakdown {
+  first_blood: { agent: string; first_bloods: number; win_pct: number }[];
+  ult_conversion: { agent: string; ult_rounds: number; win_pct: number }[];
+  role_comps: { label: string; games: number; win_pct: number }[];
 }
 
 export interface VctGameListItem {
@@ -554,6 +561,8 @@ export const api = {
       `/api/v1/abilities/impact${map ? `?map=${encodeURIComponent(map)}` : ''}`,
     ),
   abilitiesImpactMaps: () => request<MapImpact[]>('/api/v1/abilities/impact/maps'),
+  abilitiesImpactBreakdown: () =>
+    request<AbilityBreakdown>('/api/v1/abilities/impact/breakdown'),
   abilitiesGames: (opts: { map?: string; search?: string; limit?: number } = {}) =>
     request<VctGameListItem[]>(
       `/api/v1/abilities/games?map=${encodeURIComponent(opts.map ?? '')}&search=${encodeURIComponent(

@@ -1,0 +1,373 @@
+diff --git a/src/vlr/api/routes/abilities.py b/src/vlr/api/routes/abilities.py
+index 06cf35d..3a04bf7 100644
+--- a/src/vlr/api/routes/abilities.py
++++ b/src/vlr/api/routes/abilities.py
+@@ -199,6 +199,7 @@ async def abilities_impact(map: str = Query("", max_length=32)) -> dict:
+             VctRound.winner_util, VctRound.loser_util,
+             VctRound.winner_ults, VctRound.loser_ults,
+             VctRound.win_condition,
++            VctRound.opening_kill_tag, VctRound.winner_tag,
+         )
+         if map.strip():
+             q = q.join(VctGame, VctGame.game_id == VctRound.game_id).where(
+@@ -207,7 +208,7 @@ async def abilities_impact(map: str = Query("", max_length=32)) -> dict:
+         rows = session.execute(q).all()
+         n = len(rows)
+ 
+-        edge_won = edge_total = ult_won = ult_total = 0
++        edge_won = edge_total = ult_won = ult_total = fb_won = fb_total = 0
+         diff_bins: dict = {b: [0, 0] for b in _DIFF_ORDER}   # bucket -> [wins, obs]
+         ult_bins: dict = {"0": [0, 0], "1": [0, 0], "2": [0, 0], "3+": [0, 0]}
+         cond: dict = {}
+@@ -215,8 +216,12 @@ async def abilities_impact(map: str = Query("", max_length=32)) -> dict:
+         def _ub(u):
+             return "3+" if u >= 3 else str(u)
+ 
+-        for wu, lu, wx, lx, wc in rows:
++        for wu, lu, wx, lx, wc, okt, wt in rows:
+             wu, lu, wx, lx = wu or 0, lu or 0, wx or 0, lx or 0
++            if okt is not None and wt is not None:
++                fb_total += 1
++                if okt == wt:
++                    fb_won += 1
+             # utility edge
+             if wu != lu:
+                 edge_total += 1
+@@ -244,6 +249,7 @@ async def abilities_impact(map: str = Query("", max_length=32)) -> dict:
+             "rounds": n,
+             "utility_edge_win_rate": round(100.0 * edge_won / edge_total, 1) if edge_total else 0.0,
+             "ult_win_rate": round(100.0 * ult_won / ult_total, 1) if ult_total else 0.0,
++            "first_blood_win_rate": round(100.0 * fb_won / fb_total, 1) if fb_total else 0.0,
+             "util_diff_buckets": [
+                 {"bucket": b, "n": diff_bins[b][1],
+                  "win_rate": round(100.0 * diff_bins[b][0] / diff_bins[b][1], 1) if diff_bins[b][1] else 0.0}
+@@ -311,6 +317,77 @@ async def abilities_impact_maps() -> list[dict]:
+         session.close()
+ 
+ 
++@router.get("/abilities/impact/breakdown")
++async def abilities_impact_breakdown() -> dict:
++    """The high-signal impact views: opening-duel conversion per agent, ult
++    conversion per agent, and role-composition win rates."""
++    from collections import Counter
++    session = get_session()
++    try:
++        # Opening-duel: win rate of the round when this agent gets first blood.
++        fb: dict = {}
++        for oka, okt, wt in session.execute(
++            select(VctRound.opening_kill_agent, VctRound.opening_kill_tag, VctRound.winner_tag)
++            .where(VctRound.opening_kill_agent.isnot(None))
++        ).all():
++            a = fb.setdefault(oka, [0, 0])
++            a[1] += 1
++            if okt is not None and okt == wt:
++                a[0] += 1
++        first_blood = sorted(
++            [{"agent": k, "first_bloods": v[1], "win_pct": round(100 * v[0] / v[1], 1)}
++             for k, v in fb.items() if v[1] >= 10],
++            key=lambda r: -r["first_bloods"],
++        )
++
++        # Ult conversion: round win rate when this agent uses their ultimate.
++        uc: dict = {}
++        for (ults,) in session.execute(
++            select(VctRound.ult_agents).where(VctRound.ult_agents.isnot(None))
++        ).all():
++            for u in (ults or []):
++                ag = u.get("agent")
++                if not ag:
++                    continue
++                a = uc.setdefault(ag, [0, 0])
++                a[1] += 1
++                if u.get("won"):
++                    a[0] += 1
++        ult_conversion = sorted(
++            [{"agent": k, "ult_rounds": v[1], "win_pct": round(100 * v[0] / v[1], 1)}
++             for k, v in uc.items() if v[1] >= 10],
++            key=lambda r: -r["win_pct"],
++        )
++
++        # Role composition win rate (from the per-game team rosters).
++        gt: dict = {}
++        for gid, tag, role, won in session.execute(
++            select(VctAbilityStat.game_id, VctAbilityStat.team_tag,
++                   VctAbilityStat.role, VctAbilityStat.won)
++            .where(VctAbilityStat.role.isnot(None))
++        ).all():
++            d = gt.setdefault((gid, tag), {"roles": Counter(), "won": False})
++            d["roles"][role] += 1
++            d["won"] = d["won"] or bool(won)
++        rc: dict = {}
++        for d in gt.values():
++            sig = tuple(sorted(d["roles"].items()))
++            a = rc.setdefault(sig, [0, 0])
++            a[1] += 1
++            if d["won"]:
++                a[0] += 1
++        role_comps = sorted(
++            [{"label": " / ".join(f"{c} {r}" for r, c in sig), "games": v[1],
++              "win_pct": round(100 * v[0] / v[1], 1)}
++             for sig, v in rc.items() if v[1] >= 10],
++            key=lambda r: -r["win_pct"],
++        )
++
++        return {"first_blood": first_blood, "ult_conversion": ult_conversion, "role_comps": role_comps}
++    finally:
++        session.close()
++
++
+ @router.get("/abilities/games")
+ async def abilities_games(
+     map: str = Query("", max_length=32),
+diff --git a/src/vlr/db/models.py b/src/vlr/db/models.py
+index a457e6c..6ab23cd 100644
+--- a/src/vlr/db/models.py
++++ b/src/vlr/db/models.py
+@@ -295,6 +295,10 @@ class VctRound(Base):
+     is_pistol: Mapped[bool] = mapped_column(default=False)
+     is_map_point: Mapped[bool] = mapped_column(default=False)
+     is_clutch: Mapped[bool] = mapped_column(default=False)
++    # Agent that got the round's opening kill (first-blood impact).
++    opening_kill_agent: Mapped[Optional[str]] = mapped_column(String(64))
++    # Ultimates used this round with outcome: [{"agent": str, "won": bool}] (ult conversion).
++    ult_agents: Mapped[Optional[dict]] = mapped_column(JSONB)
+     # Compact timeline: [{"t": sec_into_round, "k": ability|ult|kill|plant|defuse, "team": 0|1, "slot"?}]
+     timeline: Mapped[Optional[dict]] = mapped_column(JSONB)
+ 
+diff --git a/src/vlr/db/session.py b/src/vlr/db/session.py
+index bda1c7e..ac4195a 100644
+--- a/src/vlr/db/session.py
++++ b/src/vlr/db/session.py
+@@ -46,6 +46,11 @@ _MIGRATIONS: list[tuple[str, str]] = [
+      "ALTER TABLE teams ADD COLUMN IF NOT EXISTS vlr_rank INTEGER"),
+     ("add_teams_vlr_record",
+      "ALTER TABLE teams ADD COLUMN IF NOT EXISTS vlr_record VARCHAR(32)"),
++    # VCT round-level per-agent attribution (first-blood + ult conversion)
++    ("add_vct_rounds_opening_kill_agent",
++     "ALTER TABLE vct_rounds ADD COLUMN IF NOT EXISTS opening_kill_agent VARCHAR(64)"),
++    ("add_vct_rounds_ult_agents",
++     "ALTER TABLE vct_rounds ADD COLUMN IF NOT EXISTS ult_agents JSONB"),
+ ]
+ 
+ 
+diff --git a/src/vlr/vct/loader.py b/src/vlr/vct/loader.py
+index 3a496f7..83f03c5 100644
+--- a/src/vlr/vct/loader.py
++++ b/src/vlr/vct/loader.py
+@@ -104,6 +104,10 @@ def import_vct_games(tier: str, year: int, limit: Optional[int] = None,
+                     wid = r.get("winner_team_id")
+                     lid = next((t for t in tids if t != wid), None)
+                     rnum = r.get("round_number")
++                    ult_ag = [
++                        {"agent": u.get("agent"), "won": u.get("team_id") == wid}
++                        for u in r.get("ult_agents", []) if u.get("agent")
++                    ]
+                     session.add(VctRound(
+                         game_id=game.game_id, round_number=rnum,
+                         winner_tag=team_tags.get(wid),
+@@ -112,6 +116,8 @@ def import_vct_games(tier: str, year: int, limit: Optional[int] = None,
+                         winner_util=r["util"].get(wid, 0), loser_util=r["util"].get(lid, 0),
+                         winner_ults=r["ults"].get(wid, 0), loser_ults=r["ults"].get(lid, 0),
+                         opening_kill_tag=team_tags.get(r.get("opening_kill_team_id")),
++                        opening_kill_agent=r.get("opening_kill_agent"),
++                        ult_agents=ult_ag,
+                         spike_planted=bool(r.get("spike_planted")),
+                         spike_defused=bool(r.get("spike_defused")),
+                         is_pistol=rnum in (1, 13),
+diff --git a/src/vlr/vct/parse.py b/src/vlr/vct/parse.py
+index c307a1a..dd72a4f 100644
+--- a/src/vlr/vct/parse.py
++++ b/src/vlr/vct/parse.py
+@@ -88,6 +88,7 @@ def parse_game(events: list, agent_map: Optional[dict] = None,
+     total_rounds = 0
+     round_wins: dict = {}
+     rounds: list = []
++    player_agent: dict = {}         # player_id -> agent name (FK / ult attribution)
+     cur: Optional[dict] = None      # in-progress round record
+ 
+     def _tidx(tid):
+@@ -100,6 +101,7 @@ def parse_game(events: list, agent_map: Optional[dict] = None,
+             "util": {t: 0 for t in tids}, "ults": {t: 0 for t in tids},
+             "alive": {t: 5 for t in tids}, "reached_1v2": {t: False for t in tids},
+             "opening_kill_team_id": None, "opening_kill_time": None,
++            "opening_kill_agent": None, "ult_agents": [],
+             "spike_planted": False, "spike_defused": False, "timeline": [],
+         }
+ 
+@@ -142,6 +144,7 @@ def parse_game(events: list, agent_map: Optional[dict] = None,
+                 )
+                 if resolved:
+                     pa.agent, pa.role = resolved
++                    player_agent[pid] = resolved[0]
+             continue
+ 
+         if "roundStarted" in e:
+@@ -194,6 +197,7 @@ def parse_game(events: list, agent_map: Optional[dict] = None,
+                 _log(_secs(e), "kill", kteam)
+                 if cur["opening_kill_team_id"] is None and kteam is not None:
+                     cur["opening_kill_team_id"] = kteam
++                    cur["opening_kill_agent"] = player_agent.get(kil)
+                     cur["opening_kill_time"] = round(_secs(e) - cur["start_time"], 1) \
+                         if _secs(e) is not None and cur["start_time"] is not None else None
+                 vteam = player_team.get(dec)
+@@ -228,6 +232,7 @@ def parse_game(events: list, agent_map: Optional[dict] = None,
+                             pa.ult_casts += 1
+                             if cur is not None and team in cur["ults"]:
+                                 cur["ults"][team] += 1
++                                cur["ult_agents"].append({"agent": player_agent.get(pid), "team_id": team})
+                                 _log(t_ev, "ult", team)
+                         last_charge[key] = c
+                     else:
+diff --git a/web/app/abilities/page.tsx b/web/app/abilities/page.tsx
+index 96d612a..1946b51 100644
+--- a/web/app/abilities/page.tsx
++++ b/web/app/abilities/page.tsx
+@@ -10,7 +10,7 @@ import { Search, Zap, Target, Crosshair, Shield } from 'lucide-react';
+ import {
+   api,
+   type AbilitySummary, type AbilityAgent, type AbilityPlayer,
+-  type AbilityImpact, type MapImpact, type VctGameListItem, type VctGameRounds,
++  type AbilityImpact, type MapImpact, type VctGameListItem, type VctGameRounds, type AbilityBreakdown,
+   type VctRoundDetail, type VctTimelineEvent,
+ } from '@/lib/api';
+ import { cn } from '@/lib/utils';
+@@ -90,6 +90,7 @@ function RoundTimeline({ round, teamA, teamB }: { round: VctRoundDetail; teamA:
+ export default function AbilitiesPage() {
+   const [summary, setSummary] = useState<AbilitySummary | null>(null);
+   const [impact, setImpact] = useState<AbilityImpact | null>(null);
++  const [breakdown, setBreakdown] = useState<AbilityBreakdown | null>(null);
+   const [mapImpact, setMapImpact] = useState<MapImpact[]>([]);
+   const [agents, setAgents] = useState<AbilityAgent[]>([]);
+   const [players, setPlayers] = useState<AbilityPlayer[]>([]);
+@@ -108,10 +109,12 @@ export default function AbilitiesPage() {
+     Promise.all([
+       api.abilitiesSummary().catch(() => null),
+       api.abilitiesImpactMaps().catch(() => [] as MapImpact[]),
++      api.abilitiesImpactBreakdown().catch(() => null),
+     ])
+-      .then(([s, m]) => {
++      .then(([s, m, b]) => {
+         setSummary(s);
+         setMapImpact(m);
++        setBreakdown(b);
+       })
+       .finally(() => setLoading(false));
+   }, []);
+@@ -194,6 +197,11 @@ export default function AbilitiesPage() {
+             initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 0.12 }}
+             className="mt-8 grid grid-cols-2 md:grid-cols-4 gap-3"
+           >
++            <StatCard
++              label="First blood → round win"
++              value={impact ? `${impact.first_blood_win_rate}%` : '—'}
++              sub="win the opening duel, win the round"
++            />
+             <StatCard
+               label="Higher-utility team wins"
+               value={impact ? `${impact.utility_edge_win_rate}%` : '—'}
+@@ -205,7 +213,6 @@ export default function AbilitiesPage() {
+               sub="when one team ults and the other doesn't"
+             />
+             <StatCard label="Rounds analysed" value={impact ? impact.rounds.toLocaleString() : '—'} />
+-            <StatCard label="Games · agents" value={`${summary?.games ?? 0} · ${summary?.agents ?? 0}`} />
+           </motion.div>
+ 
+           {/* Map filter + tabs */}
+@@ -245,6 +252,42 @@ export default function AbilitiesPage() {
+           {/* IMPACT TAB */}
+           {tab === 'impact' && (
+             <motion.div initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} className="mt-6 space-y-4">
++              {/* High-signal per-agent impact */}
++              <div className="grid md:grid-cols-2 gap-4">
++                <div className="bg-surface border border-border rounded-2xl p-4">
++                  <div className="text-sm font-semibold text-ink">Opening duel — who wins the entry</div>
++                  <div className="text-[0.7rem] text-ink-dim mb-3">round win% when this agent draws first blood · ranked by volume</div>
++                  <div className="space-y-1.5">
++                    {(breakdown?.first_blood ?? []).slice(0, 8).map((a) => (
++                      <RankBar key={a.agent} label={a.agent} pct={a.win_pct} sub={`${a.first_bloods} FBs`} />
++                    ))}
++                    {(!breakdown || breakdown.first_blood.length === 0) && <EmptyRow />}
++                  </div>
++                </div>
++                <div className="bg-surface border border-border rounded-2xl p-4">
++                  <div className="text-sm font-semibold text-ink">Ult conversion — which ults swing rounds</div>
++                  <div className="text-[0.7rem] text-ink-dim mb-3">round win% when this agent spends their ultimate</div>
++                  <div className="space-y-1.5">
++                    {(breakdown?.ult_conversion ?? []).slice(0, 8).map((a) => (
++                      <RankBar key={a.agent} label={a.agent} pct={a.win_pct} sub={`${a.ult_rounds} ults`} />
++                    ))}
++                    {(!breakdown || breakdown.ult_conversion.length === 0) && <EmptyRow />}
++                  </div>
++                </div>
++              </div>
++
++              {/* Composition meta */}
++              <div className="bg-surface border border-border rounded-2xl p-4">
++                <div className="text-sm font-semibold text-ink">Composition — win% by role make-up</div>
++                <div className="text-[0.7rem] text-ink-dim mb-3">the comp meta: how a team&apos;s role split affects winning</div>
++                <div className="space-y-1.5">
++                  {(breakdown?.role_comps ?? []).slice(0, 6).map((c) => (
++                    <RankBar key={c.label} label={c.label} pct={c.win_pct} sub={`${c.games} games`} wide />
++                  ))}
++                  {(!breakdown || breakdown.role_comps.length === 0) && <EmptyRow />}
++                </div>
++              </div>
++
+               <ChartCard
+                 title="The meta map"
+                 subtitle="utility per round × win rate · bubble = games · colour = role"
+@@ -621,3 +664,20 @@ function Highlight({ label, name, sub }: { label: string; name?: string | null;
+     </div>
+   );
+ }
++
++function RankBar({ label, pct, sub, wide }: { label: string; pct: number; sub?: string; wide?: boolean }) {
++  return (
++    <div className="flex items-center gap-3 text-xs">
++      <div className={cn('text-ink truncate', wide ? 'w-40 md:w-56' : 'w-20')} title={label}>{label}</div>
++      <div className="flex-1 h-4 bg-bg rounded-full overflow-hidden">
++        <div className="h-full rounded-full transition-all" style={{ width: `${Math.min(100, Math.max(0, pct))}%`, background: pct >= 50 ? ACCENT : '#52525b' }} />
++      </div>
++      <div className="w-10 text-right font-mono tabular text-ink font-semibold">{pct}%</div>
++      {sub && <div className="w-16 text-right text-ink-dim tabular">{sub}</div>}
++    </div>
++  );
++}
++
++function EmptyRow() {
++  return <div className="text-xs text-ink-dim py-3 text-center">Not enough data yet — import more games.</div>;
++}
+diff --git a/web/lib/api.ts b/web/lib/api.ts
+index 6d68216..076d437 100644
+--- a/web/lib/api.ts
++++ b/web/lib/api.ts
+@@ -349,6 +349,7 @@ export interface AbilityImpact {
+   rounds: number;
+   utility_edge_win_rate: number;
+   ult_win_rate: number;
++  first_blood_win_rate: number;
+   util_diff_buckets: { bucket: string; n: number; win_rate: number }[];
+   ult_buckets: { ults: string; n: number; win_rate: number }[];
+   by_condition: { condition: string; rounds: number; avg_util: number; avg_ults: number }[];
+@@ -363,6 +364,12 @@ export interface MapImpact {
+   avg_util_per_round: number;
+ }
+ 
++export interface AbilityBreakdown {
++  first_blood: { agent: string; first_bloods: number; win_pct: number }[];
++  ult_conversion: { agent: string; ult_rounds: number; win_pct: number }[];
++  role_comps: { label: string; games: number; win_pct: number }[];
++}
++
+ export interface VctGameListItem {
+   game_id: string;
+   map: string | null;
+@@ -554,6 +561,8 @@ export const api = {
+       `/api/v1/abilities/impact${map ? `?map=${encodeURIComponent(map)}` : ''}`,
+     ),
+   abilitiesImpactMaps: () => request<MapImpact[]>('/api/v1/abilities/impact/maps'),
++  abilitiesImpactBreakdown: () =>
++    request<AbilityBreakdown>('/api/v1/abilities/impact/breakdown'),
+   abilitiesGames: (opts: { map?: string; search?: string; limit?: number } = {}) =>
+     request<VctGameListItem[]>(
+       `/api/v1/abilities/games?map=${encodeURIComponent(opts.map ?? '')}&search=${encodeURIComponent(

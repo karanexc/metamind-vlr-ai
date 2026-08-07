@@ -88,6 +88,7 @@ def parse_game(events: list, agent_map: Optional[dict] = None,
     total_rounds = 0
     round_wins: dict = {}
     rounds: list = []
+    player_agent: dict = {}         # player_id -> agent name (FK / ult attribution)
     cur: Optional[dict] = None      # in-progress round record
 
     def _tidx(tid):
@@ -100,6 +101,7 @@ def parse_game(events: list, agent_map: Optional[dict] = None,
             "util": {t: 0 for t in tids}, "ults": {t: 0 for t in tids},
             "alive": {t: 5 for t in tids}, "reached_1v2": {t: False for t in tids},
             "opening_kill_team_id": None, "opening_kill_time": None,
+            "opening_kill_agent": None, "ult_agents": [],
             "spike_planted": False, "spike_defused": False, "timeline": [],
         }
 
@@ -142,6 +144,7 @@ def parse_game(events: list, agent_map: Optional[dict] = None,
                 )
                 if resolved:
                     pa.agent, pa.role = resolved
+                    player_agent[pid] = resolved[0]
             continue
 
         if "roundStarted" in e:
@@ -194,6 +197,7 @@ def parse_game(events: list, agent_map: Optional[dict] = None,
                 _log(_secs(e), "kill", kteam)
                 if cur["opening_kill_team_id"] is None and kteam is not None:
                     cur["opening_kill_team_id"] = kteam
+                    cur["opening_kill_agent"] = player_agent.get(kil)
                     cur["opening_kill_time"] = round(_secs(e) - cur["start_time"], 1) \
                         if _secs(e) is not None and cur["start_time"] is not None else None
                 vteam = player_team.get(dec)
@@ -228,6 +232,7 @@ def parse_game(events: list, agent_map: Optional[dict] = None,
                             pa.ult_casts += 1
                             if cur is not None and team in cur["ults"]:
                                 cur["ults"][team] += 1
+                                cur["ult_agents"].append({"agent": player_agent.get(pid), "team_id": team})
                                 _log(t_ev, "ult", team)
                         last_charge[key] = c
                     else:

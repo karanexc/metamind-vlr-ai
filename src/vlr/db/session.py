@@ -46,6 +46,11 @@ _MIGRATIONS: list[tuple[str, str]] = [
      "ALTER TABLE teams ADD COLUMN IF NOT EXISTS vlr_rank INTEGER"),
     ("add_teams_vlr_record",
      "ALTER TABLE teams ADD COLUMN IF NOT EXISTS vlr_record VARCHAR(32)"),
+    # VCT round-level per-agent attribution (first-blood + ult conversion)
+    ("add_vct_rounds_opening_kill_agent",
+     "ALTER TABLE vct_rounds ADD COLUMN IF NOT EXISTS opening_kill_agent VARCHAR(64)"),
+    ("add_vct_rounds_ult_agents",
+     "ALTER TABLE vct_rounds ADD COLUMN IF NOT EXISTS ult_agents JSONB"),
 ]
 
 

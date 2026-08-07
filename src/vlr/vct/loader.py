@@ -104,6 +104,10 @@ def import_vct_games(tier: str, year: int, limit: Optional[int] = None,
                     wid = r.get("winner_team_id")
                     lid = next((t for t in tids if t != wid), None)
                     rnum = r.get("round_number")
+                    ult_ag = [
+                        {"agent": u.get("agent"), "won": u.get("team_id") == wid}
+                        for u in r.get("ult_agents", []) if u.get("agent")
+                    ]
                     session.add(VctRound(
                         game_id=game.game_id, round_number=rnum,
                         winner_tag=team_tags.get(wid),
@@ -112,6 +116,8 @@ def import_vct_games(tier: str, year: int, limit: Optional[int] = None,
                         winner_util=r["util"].get(wid, 0), loser_util=r["util"].get(lid, 0),
                         winner_ults=r["ults"].get(wid, 0), loser_ults=r["ults"].get(lid, 0),
                         opening_kill_tag=team_tags.get(r.get("opening_kill_team_id")),
+                        opening_kill_agent=r.get("opening_kill_agent"),
+                        ult_agents=ult_ag,
                         spike_planted=bool(r.get("spike_planted")),
                         spike_defused=bool(r.get("spike_defused")),
                         is_pistol=rnum in (1, 13),

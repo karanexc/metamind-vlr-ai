@@ -199,6 +199,7 @@ async def abilities_impact(map: str = Query("", max_length=32)) -> dict:
             VctRound.winner_util, VctRound.loser_util,
             VctRound.winner_ults, VctRound.loser_ults,
             VctRound.win_condition,
+            VctRound.opening_kill_tag, VctRound.winner_tag,
         )
         if map.strip():
             q = q.join(VctGame, VctGame.game_id == VctRound.game_id).where(
@@ -207,7 +208,7 @@ async def abilities_impact(map: str = Query("", max_length=32)) -> dict:
         rows = session.execute(q).all()
         n = len(rows)
 
-        edge_won = edge_total = ult_won = ult_total = 0
+        edge_won = edge_total = ult_won = ult_total = fb_won = fb_total = 0
         diff_bins: dict = {b: [0, 0] for b in _DIFF_ORDER}   # bucket -> [wins, obs]
         ult_bins: dict = {"0": [0, 0], "1": [0, 0], "2": [0, 0], "3+": [0, 0]}
         cond: dict = {}
@@ -215,8 +216,12 @@ async def abilities_impact(map: str = Query("", max_length=32)) -> dict:
         def _ub(u):
             return "3+" if u >= 3 else str(u)
 
-        for wu, lu, wx, lx, wc in rows:
+        for wu, lu, wx, lx, wc, okt, wt in rows:
             wu, lu, wx, lx = wu or 0, lu or 0, wx or 0, lx or 0
+            if okt is not None and wt is not None:
+                fb_total += 1
+                if okt == wt:
+                    fb_won += 1
             # utility edge
             if wu != lu:
                 edge_total += 1
@@ -244,6 +249,7 @@ async def abilities_impact(map: str = Query("", max_length=32)) -> dict:
             "rounds": n,
             "utility_edge_win_rate": round(100.0 * edge_won / edge_total, 1) if edge_total else 0.0,
             "ult_win_rate": round(100.0 * ult_won / ult_total, 1) if ult_total else 0.0,
+            "first_blood_win_rate": round(100.0 * fb_won / fb_total, 1) if fb_total else 0.0,
             "util_diff_buckets": [
                 {"bucket": b, "n": diff_bins[b][1],
                  "win_rate": round(100.0 * diff_bins[b][0] / diff_bins[b][1], 1) if diff_bins[b][1] else 0.0}
@@ -307,6 +313,77 @@ async def abilities_impact_maps() -> list[dict]:
             })
         out.sort(key=lambda r: r["rounds"], reverse=True)
         return out
+    finally:
+        session.close()
+
+
+@router.get("/abilities/impact/breakdown")
+async def abilities_impact_breakdown() -> dict:
+    """The high-signal impact views: opening-duel conversion per agent, ult
+    conversion per agent, and role-composition win rates."""
+    from collections import Counter
+    session = get_session()
+    try:
+        # Opening-duel: win rate of the round when this agent gets first blood.
+        fb: dict = {}
+        for oka, okt, wt in session.execute(
+            select(VctRound.opening_kill_agent, VctRound.opening_kill_tag, VctRound.winner_tag)
+            .where(VctRound.opening_kill_agent.isnot(None))
+        ).all():
+            a = fb.setdefault(oka, [0, 0])
+            a[1] += 1
+            if okt is not None and okt == wt:
+                a[0] += 1
+        first_blood = sorted(
+            [{"agent": k, "first_bloods": v[1], "win_pct": round(100 * v[0] / v[1], 1)}
+             for k, v in fb.items() if v[1] >= 10],
+            key=lambda r: -r["first_bloods"],
+        )
+
+        # Ult conversion: round win rate when this agent uses their ultimate.
+        uc: dict = {}
+        for (ults,) in session.execute(
+            select(VctRound.ult_agents).where(VctRound.ult_agents.isnot(None))
+        ).all():
+            for u in (ults or []):
+                ag = u.get("agent")
+                if not ag:
+                    continue
+                a = uc.setdefault(ag, [0, 0])
+                a[1] += 1
+                if u.get("won"):
+                    a[0] += 1
+        ult_conversion = sorted(
+            [{"agent": k, "ult_rounds": v[1], "win_pct": round(100 * v[0] / v[1], 1)}
+             for k, v in uc.items() if v[1] >= 10],
+            key=lambda r: -r["win_pct"],
+        )
+
+        # Role composition win rate (from the per-game team rosters).
+        gt: dict = {}
+        for gid, tag, role, won in session.execute(
+            select(VctAbilityStat.game_id, VctAbilityStat.team_tag,
+                   VctAbilityStat.role, VctAbilityStat.won)
+            .where(VctAbilityStat.role.isnot(None))
+        ).all():
+            d = gt.setdefault((gid, tag), {"roles": Counter(), "won": False})
+            d["roles"][role] += 1
+            d["won"] = d["won"] or bool(won)
+        rc: dict = {}
+        for d in gt.values():
+            sig = tuple(sorted(d["roles"].items()))
+            a = rc.setdefault(sig, [0, 0])
+            a[1] += 1
+            if d["won"]:
+                a[0] += 1
+        role_comps = sorted(
+            [{"label": " / ".join(f"{c} {r}" for r, c in sig), "games": v[1],
+              "win_pct": round(100 * v[0] / v[1], 1)}
+             for sig, v in rc.items() if v[1] >= 10],
+            key=lambda r: -r["win_pct"],
+        )
+
+        return {"first_blood": first_blood, "ult_conversion": ult_conversion, "role_comps": role_comps}
     finally:
         session.close()
 
