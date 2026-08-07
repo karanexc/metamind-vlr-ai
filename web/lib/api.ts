@@ -458,6 +458,36 @@ export interface VctGameRounds {
   rounds?: VctRoundDetail[];
 }
 
+// Prediction track record
+export interface PredictionItem {
+  match_id: number;
+  team_a: string;
+  team_b: string;
+  team_a_logo: string | null;
+  team_b_logo: string | null;
+  event: string | null;
+  scheduled_at: string | null;
+  best_of: number | null;
+  prob_a: number;
+  prob_b: number;
+  predicted_winner: string;
+  confidence: string | null;
+  predicted_score_a: number | null;
+  predicted_score_b: number | null;
+  source: string;
+  actual_score_a: number | null;
+  actual_score_b: number | null;
+  actual_winner: string | null;
+  correct: boolean | null;
+}
+
+export interface PredictionAccuracy {
+  overall: { n: number; correct: number; hit_rate: number };
+  live: { n: number; correct: number; hit_rate: number };
+  backtest: { n: number; correct: number; hit_rate: number };
+  calibration: { band: string; n: number; actual_win_rate: number }[];
+}
+
 // --- API methods --------------------------------------------------------
 
 export const api = {
@@ -563,6 +593,15 @@ export const api = {
   abilitiesImpactMaps: () => request<MapImpact[]>('/api/v1/abilities/impact/maps'),
   abilitiesImpactBreakdown: () =>
     request<AbilityBreakdown>('/api/v1/abilities/impact/breakdown'),
+
+  // Prediction track record
+  predictionsUpcoming: (limit = 50) =>
+    request<PredictionItem[]>(`/api/v1/predictions/upcoming?limit=${limit}`),
+  predictionsResults: (source = '', limit = 80) =>
+    request<PredictionItem[]>(
+      `/api/v1/predictions/results?source=${encodeURIComponent(source)}&limit=${limit}`,
+    ),
+  predictionsAccuracy: () => request<PredictionAccuracy>('/api/v1/predictions/accuracy'),
   abilitiesGames: (opts: { map?: string; search?: string; limit?: number } = {}) =>
     request<VctGameListItem[]>(
       `/api/v1/abilities/games?map=${encodeURIComponent(opts.map ?? '')}&search=${encodeURIComponent(

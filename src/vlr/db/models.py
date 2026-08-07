@@ -303,3 +303,42 @@ class VctRound(Base):
     timeline: Mapped[Optional[dict]] = mapped_column(JSONB)
 
     game = relationship("VctGame")
+
+
+# --- Prediction track record ---------------------------------------------
+# The model's call on a vlr match, made BEFORE the result was known (live) or
+# reconstructed point-in-time (backtest), then scored against what happened.
+# Keyed by vlr match id, so a completed match links its prediction to its row.
+
+
+class Prediction(Base):
+    __tablename__ = "predictions"
+
+    match_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)   # vlr match id
+    team_a_id: Mapped[Optional[int]] = mapped_column(BigInteger)
+    team_b_id: Mapped[Optional[int]] = mapped_column(BigInteger)
+    team_a_name: Mapped[str] = mapped_column(String(255))
+    team_b_name: Mapped[str] = mapped_column(String(255))
+    event_name: Mapped[Optional[str]] = mapped_column(String(512))
+    scheduled_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    best_of: Mapped[Optional[int]] = mapped_column(Integer)
+
+    # What the model said, before the outcome was known.
+    prob_a: Mapped[float] = mapped_column(Float, nullable=False)
+    prob_b: Mapped[float] = mapped_column(Float, nullable=False)
+    predicted_score_a: Mapped[Optional[int]] = mapped_column(Integer)
+    predicted_score_b: Mapped[Optional[int]] = mapped_column(Integer)
+    predicted_winner: Mapped[str] = mapped_column(String(255))
+    confidence: Mapped[Optional[str]] = mapped_column(String(16))
+    model_version: Mapped[Optional[str]] = mapped_column(String(32))
+    source: Mapped[str] = mapped_column(String(16), default="live")       # 'live' | 'backtest'
+    predicted_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=datetime.utcnow, nullable=False
+    )
+
+    # Filled once the match completes.
+    actual_score_a: Mapped[Optional[int]] = mapped_column(Integer)
+    actual_score_b: Mapped[Optional[int]] = mapped_column(Integer)
+    actual_winner: Mapped[Optional[str]] = mapped_column(String(255))
+    correct: Mapped[Optional[bool]] = mapped_column()
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))

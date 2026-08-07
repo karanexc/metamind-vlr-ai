@@ -86,6 +86,34 @@ def fetch_event_matches(event_id: int) -> list[MatchListing]:
     return parse_results_listing(html, base_url=settings.vlr_base_url)
 
 
+def fetch_upcoming_page(page: int = 1) -> list[MatchListing]:
+    """vlr's upcoming/scheduled matches (the /matches feed, not /matches/results)."""
+    if page == 1:
+        url = f"{settings.vlr_base_url}/matches"
+    else:
+        url = f"{settings.vlr_base_url}/matches/?page={page}"
+    html = fetch(url)
+    return parse_results_listing(html, base_url=settings.vlr_base_url)
+
+
+def scrape_upcoming(pages: int = 1) -> int:
+    """Ingest upcoming matches (teams + scheduled time, null scores) so the
+    predictor can call them before they're played. Skips existing; best-effort."""
+    listings: list[MatchListing] = []
+    for p in range(1, pages + 1):
+        try:
+            listings.extend(fetch_upcoming_page(p))
+        except HttpError as exc:
+            log.error("Failed to fetch upcoming page %d: %s", p, exc)
+    if not listings:
+        return 0
+    try:
+        return _scrape_listings(listings, f"{len(listings)} upcoming match(es)").get("ok", 0)
+    except Exception:
+        log.exception("scrape_upcoming failed")
+        return 0
+
+
 def fetch_and_parse_match(url: str) -> MatchDetail:
     html = fetch(url)
     return parse_match_detail(html, match_url=url)
@@ -929,6 +957,21 @@ def run_full_refresh(pages: int = 1) -> dict:
     except Exception:
         log.exception("full-refresh: tier classify failed")
         result["events_reclassified"] = 0
+
+    # Prediction track record: pull upcoming matches, predict them, and link
+    # results for any predicted match that has since completed.
+    try:
+        result["upcoming_scraped"] = scrape_upcoming()
+    except Exception:
+        log.exception("full-refresh: scrape upcoming failed")
+        result["upcoming_scraped"] = 0
+
+    try:
+        from ..ml.track_record import link_results, predict_upcoming
+        result["predictions_made"] = predict_upcoming()
+        result["predictions_linked"] = link_results()
+    except Exception:
+        log.exception("full-refresh: predictions failed")
 
     log.info("full-refresh complete: %s", result)
     return result

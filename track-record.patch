@@ -1,0 +1,801 @@
+diff --git a/src/vlr/api/main.py b/src/vlr/api/main.py
+index f639f5c..5a49b1f 100644
+--- a/src/vlr/api/main.py
++++ b/src/vlr/api/main.py
+@@ -17,7 +17,7 @@ from slowapi import _rate_limit_exceeded_handler
+ from slowapi.errors import RateLimitExceeded
+ 
+ from .limits import limiter
+-from .routes import abilities, depth, explain, live, matches, meta, pickem, players, predict, stats, teams
++from .routes import abilities, depth, explain, live, matches, meta, pickem, players, predict, predictions, stats, teams
+ from .scheduler import start_scheduler, stop_scheduler
+ 
+ log = logging.getLogger(__name__)
+@@ -114,6 +114,7 @@ app.include_router(live.router, prefix=API_PREFIX, tags=["live"])
+ app.include_router(meta.router, prefix=API_PREFIX, tags=["meta"])
+ app.include_router(depth.router, prefix=API_PREFIX, tags=["depth"])
+ app.include_router(abilities.router, prefix=API_PREFIX, tags=["abilities"])
++app.include_router(predictions.router, prefix=API_PREFIX, tags=["predictions"])
+ 
+ 
+ # --- Generic error handler ------------------------------------------------
+diff --git a/src/vlr/api/routes/predictions.py b/src/vlr/api/routes/predictions.py
+new file mode 100644
+index 0000000..30c5bf8
+--- /dev/null
++++ b/src/vlr/api/routes/predictions.py
+@@ -0,0 +1,115 @@
++"""Prediction track record — the model's calls vs actual results (live vlr)."""
++from __future__ import annotations
++
++from fastapi import APIRouter, Query
++from sqlalchemy import select
++
++from vlr.db.models import Prediction, Team
++from vlr.db.session import get_session
++
++router = APIRouter()
++
++
++def _logos(session, rows: list) -> dict:
++    ids = {p.team_a_id for p in rows} | {p.team_b_id for p in rows}
++    ids.discard(None)
++    out: dict = {}
++    if ids:
++        for tid, logo in session.execute(
++            select(Team.id, Team.logo_url).where(Team.id.in_(ids))
++        ).all():
++            if logo:
++                out[int(tid)] = logo
++    return out
++
++
++def _row(p: Prediction, logos: dict) -> dict:
++    return {
++        "match_id": p.match_id,
++        "team_a": p.team_a_name, "team_b": p.team_b_name,
++        "team_a_logo": logos.get(p.team_a_id), "team_b_logo": logos.get(p.team_b_id),
++        "event": p.event_name,
++        "scheduled_at": p.scheduled_at.isoformat() if p.scheduled_at else None,
++        "best_of": p.best_of,
++        "prob_a": p.prob_a, "prob_b": p.prob_b,
++        "predicted_winner": p.predicted_winner, "confidence": p.confidence,
++        "predicted_score_a": p.predicted_score_a, "predicted_score_b": p.predicted_score_b,
++        "source": p.source,
++        "actual_score_a": p.actual_score_a, "actual_score_b": p.actual_score_b,
++        "actual_winner": p.actual_winner, "correct": p.correct,
++    }
++
++
++@router.get("/predictions/upcoming")
++async def predictions_upcoming(limit: int = Query(50, ge=1, le=200)) -> list[dict]:
++    """Matches the model has called but that haven't been played/scored yet."""
++    session = get_session()
++    try:
++        rows = session.execute(
++            select(Prediction).where(Prediction.correct.is_(None))
++            .order_by(Prediction.scheduled_at.asc().nullslast())
++            .limit(limit)
++        ).scalars().all()
++        logos = _logos(session, rows)
++        return [_row(p, logos) for p in rows]
++    finally:
++        session.close()
++
++
++@router.get("/predictions/results")
++async def predictions_results(
++    source: str = Query("", max_length=16),
++    limit: int = Query(80, ge=1, le=300),
++) -> list[dict]:
++    """Completed matches we predicted, with predicted vs actual + correctness."""
++    session = get_session()
++    try:
++        q = select(Prediction).where(Prediction.correct.isnot(None))
++        if source.strip() in ("live", "backtest"):
++            q = q.where(Prediction.source == source.strip())
++        q = q.order_by(
++            Prediction.completed_at.desc().nullslast(),
++            Prediction.scheduled_at.desc().nullslast(),
++        ).limit(limit)
++        rows = session.execute(q).scalars().all()
++        logos = _logos(session, rows)
++        return [_row(p, logos) for p in rows]
++    finally:
++        session.close()
++
++
++@router.get("/predictions/accuracy")
++async def predictions_accuracy() -> dict:
++    """Hit-rate (overall / live / backtest) + calibration by confidence band."""
++    session = get_session()
++    try:
++        rows = session.execute(
++            select(Prediction.source, Prediction.prob_a, Prediction.prob_b, Prediction.correct)
++            .where(Prediction.correct.isnot(None))
++        ).all()
++
++        def acc(correct_flags: list) -> dict:
++            n = len(correct_flags)
++            c = sum(1 for r in correct_flags if r)
++            return {"n": n, "correct": c, "hit_rate": round(100 * c / n, 1) if n else 0.0}
++
++        live = [r for s, _, _, r in rows if s == "live"]
++        back = [r for s, _, _, r in rows if s == "backtest"]
++        allp = [r for _, _, _, r in rows]
++
++        bands = {"50–60": [0, 0], "60–70": [0, 0], "70–80": [0, 0], "80–90": [0, 0], "90–100": [0, 0]}
++        for s, pa, pb, r in rows:
++            p = max(pa, pb) * 100
++            band = ("50–60" if p < 60 else "60–70" if p < 70 else
++                    "70–80" if p < 80 else "80–90" if p < 90 else "90–100")
++            bands[band][1] += 1
++            if r:
++                bands[band][0] += 1
++        calibration = [
++            {"band": k, "n": v[1], "actual_win_rate": round(100 * v[0] / v[1], 1) if v[1] else 0.0}
++            for k, v in bands.items()
++        ]
++
++        return {"overall": acc(allp), "live": acc(live), "backtest": acc(back), "calibration": calibration}
++    finally:
++        session.close()
+diff --git a/src/vlr/cli.py b/src/vlr/cli.py
+index 0a4b1ab..1186cd8 100644
+--- a/src/vlr/cli.py
++++ b/src/vlr/cli.py
+@@ -95,6 +95,22 @@ def import_vct_abilities_cmd(
+ 
+     result = import_vct_games(tier, year, limit=limit, on_progress=_prog)
+     console.print(f"[bold green]VCT import done[/]: {result}")
++
++
++@app.command("backtest-predictions")
++def backtest_predictions_cmd(
++    limit: int = typer.Option(200, help="most recent completed matches to score"),
++    verbose: bool = typer.Option(False, "--verbose", "-v"),
++) -> None:
++    """Score the model on recent completed vlr matches (point-in-time) to seed
++    the Track Record with immediate accuracy numbers.
++
++        python -m src.vlr.cli backtest-predictions --limit 200
++    """
++    _configure_logging(verbose)
++    from .ml.track_record import backtest_recent
++    result = backtest_recent(limit=limit)
++    console.print(f"[bold green]Backtest done[/]: {result}")
+     console.print("[green]Schema created and migrations applied.[/green]")
+ 
+     # Check whether tier classifications are missing — common after a 7b upgrade
+diff --git a/src/vlr/db/models.py b/src/vlr/db/models.py
+index 6ab23cd..2593098 100644
+--- a/src/vlr/db/models.py
++++ b/src/vlr/db/models.py
+@@ -303,3 +303,42 @@ class VctRound(Base):
+     timeline: Mapped[Optional[dict]] = mapped_column(JSONB)
+ 
+     game = relationship("VctGame")
++
++
++# --- Prediction track record ---------------------------------------------
++# The model's call on a vlr match, made BEFORE the result was known (live) or
++# reconstructed point-in-time (backtest), then scored against what happened.
++# Keyed by vlr match id, so a completed match links its prediction to its row.
++
++
++class Prediction(Base):
++    __tablename__ = "predictions"
++
++    match_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)   # vlr match id
++    team_a_id: Mapped[Optional[int]] = mapped_column(BigInteger)
++    team_b_id: Mapped[Optional[int]] = mapped_column(BigInteger)
++    team_a_name: Mapped[str] = mapped_column(String(255))
++    team_b_name: Mapped[str] = mapped_column(String(255))
++    event_name: Mapped[Optional[str]] = mapped_column(String(512))
++    scheduled_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
++    best_of: Mapped[Optional[int]] = mapped_column(Integer)
++
++    # What the model said, before the outcome was known.
++    prob_a: Mapped[float] = mapped_column(Float, nullable=False)
++    prob_b: Mapped[float] = mapped_column(Float, nullable=False)
++    predicted_score_a: Mapped[Optional[int]] = mapped_column(Integer)
++    predicted_score_b: Mapped[Optional[int]] = mapped_column(Integer)
++    predicted_winner: Mapped[str] = mapped_column(String(255))
++    confidence: Mapped[Optional[str]] = mapped_column(String(16))
++    model_version: Mapped[Optional[str]] = mapped_column(String(32))
++    source: Mapped[str] = mapped_column(String(16), default="live")       # 'live' | 'backtest'
++    predicted_at: Mapped[datetime] = mapped_column(
++        DateTime(timezone=True), default=datetime.utcnow, nullable=False
++    )
++
++    # Filled once the match completes.
++    actual_score_a: Mapped[Optional[int]] = mapped_column(Integer)
++    actual_score_b: Mapped[Optional[int]] = mapped_column(Integer)
++    actual_winner: Mapped[Optional[str]] = mapped_column(String(255))
++    correct: Mapped[Optional[bool]] = mapped_column()
++    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+diff --git a/src/vlr/ml/track_record.py b/src/vlr/ml/track_record.py
+new file mode 100644
+index 0000000..c1324e6
+--- /dev/null
++++ b/src/vlr/ml/track_record.py
+@@ -0,0 +1,192 @@
++"""Prediction track record — the model's calls vs reality, on live vlr matches.
++
++Two sources, both leaning on the point-in-time feature pipeline (features for a
++match use ONLY data from before it):
++  * backtest — predict recent COMPLETED matches as_of their own date, score vs
++    actual. Immediate accuracy numbers. Labelled 'backtest' (the model was
++    trained on history, so treat as illustrative, not the honest headline).
++  * live — predict UPCOMING matches as_of now (before they're played); the
++    result is linked in once the match completes. Leakage-free by construction.
++
++All on the live vlr dataset. Nothing here touches the VCT (2022-24) data.
++"""
++from __future__ import annotations
++
++import logging
++from datetime import datetime
++from typing import Optional
++
++from sqlalchemy import text as sql_text
++
++from ..db.models import Prediction
++from ..db.session import get_session
++from ..ml.features import build_team_features
++from ..ml.model import load_model, predict_match_proba
++
++log = logging.getLogger(__name__)
++
++
++def _confidence(prob_a: float) -> str:
++    m = abs(prob_a - 0.5)
++    return "high" if m > 0.15 else "medium" if m > 0.07 else "low"
++
++
++def _lineup_asof(session, tid: int, as_of: datetime) -> Optional[list[int]]:
++    """The 5 players from this team's most recent COMPLETED match before as_of."""
++    row = session.execute(sql_text("""
++        SELECT m.id FROM matches m
++        WHERE (m.team_a_id = :tid OR m.team_b_id = :tid)
++          AND m.score_a IS NOT NULL AND m.score_b IS NOT NULL
++          AND (m.match_datetime IS NULL OR m.match_datetime < :as_of)
++        ORDER BY m.match_datetime DESC NULLS LAST
++        LIMIT 1
++    """), {"tid": tid, "as_of": as_of}).first()
++    if row is None:
++        return None
++    players = session.execute(sql_text("""
++        SELECT DISTINCT player_id FROM player_map_stats
++        WHERE match_id = :mid AND team_id = :tid
++        LIMIT 5
++    """), {"mid": row[0], "tid": tid}).all()
++    ids = [p[0] for p in players]
++    return ids or None
++
++
++def predict_asof(session, team_a_id: int, team_b_id: int,
++                 best_of: int, as_of: datetime) -> Optional[dict]:
++    """Point-in-time win-probability for A vs B using only data before as_of."""
++    if load_model() is None:
++        return None
++    la = _lineup_asof(session, team_a_id, as_of)
++    lb = _lineup_asof(session, team_b_id, as_of)
++    if not la or not lb:
++        return None
++    ta = build_team_features(session, la, as_of)
++    tb = build_team_features(session, lb, as_of)
++    features: dict = {}
++    features.update(ta.to_dict(prefix="team_a_"))
++    features.update(tb.to_dict(prefix="team_b_"))
++    a, b = ta.to_dict(prefix=""), tb.to_dict(prefix="")
++    for k in a:
++        features[f"diff_{k}"] = a[k] - b[k]
++    return predict_match_proba(features, best_of=best_of)
++
++
++def _store(session, *, match_id, ta_id, tb_id, ta, tb, event, dt, bo, res,
++           source, predicted_at, actual=None):
++    pa = res["prob_a"]
++    pred_winner = ta if pa >= 0.5 else tb
++    row = Prediction(
++        match_id=match_id, team_a_id=ta_id, team_b_id=tb_id,
++        team_a_name=ta, team_b_name=tb, event_name=event, scheduled_at=dt, best_of=bo,
++        prob_a=round(pa, 3), prob_b=round(res["prob_b"], 3),
++        predicted_score_a=res.get("predicted_score_a"),
++        predicted_score_b=res.get("predicted_score_b"),
++        predicted_winner=pred_winner, confidence=_confidence(pa),
++        model_version="v1", source=source, predicted_at=predicted_at,
++    )
++    if actual is not None:
++        sa, sb = actual
++        aw = ta if sa > sb else tb
++        row.actual_score_a, row.actual_score_b = sa, sb
++        row.actual_winner = aw
++        row.correct = (pred_winner == aw)
++        row.completed_at = dt
++    session.add(row)
++    return pred_winner
++
++
++def backtest_recent(limit: int = 200) -> dict:
++    """Predict the most recent completed matches point-in-time; store vs actual."""
++    stats = {"considered": 0, "predicted": 0, "skipped": 0}
++    session = get_session()
++    try:
++        rows = session.execute(sql_text("""
++            SELECT m.id, m.team_a_id, m.team_b_id, m.team_a_name, m.team_b_name,
++                   m.score_a, m.score_b, m.best_of, m.match_datetime, e.name
++            FROM matches m LEFT JOIN events e ON e.id = m.event_id
++            WHERE m.score_a IS NOT NULL AND m.score_b IS NOT NULL
++              AND m.team_a_id IS NOT NULL AND m.team_b_id IS NOT NULL
++              AND m.match_datetime IS NOT NULL
++            ORDER BY m.match_datetime DESC
++            LIMIT :lim
++        """), {"lim": limit}).all()
++        for mid, ta_id, tb_id, ta, tb, sa, sb, bo, dt, event in rows:
++            stats["considered"] += 1
++            if session.get(Prediction, mid):
++                stats["skipped"] += 1
++                continue
++            res = predict_asof(session, ta_id, tb_id, bo or 3, dt)
++            if res is None:
++                stats["skipped"] += 1
++                continue
++            _store(session, match_id=mid, ta_id=ta_id, tb_id=tb_id, ta=ta, tb=tb,
++                   event=event, dt=dt, bo=bo, res=res, source="backtest",
++                   predicted_at=dt, actual=(sa, sb))
++            stats["predicted"] += 1
++        session.commit()
++        return stats
++    finally:
++        session.close()
++
++
++def predict_upcoming() -> dict:
++    """Predict upcoming matches (in the DB, no result yet) as_of now."""
++    stats = {"upcoming": 0, "predicted": 0, "skipped": 0}
++    session = get_session()
++    try:
++        now = datetime.utcnow()
++        rows = session.execute(sql_text("""
++            SELECT m.id, m.team_a_id, m.team_b_id, m.team_a_name, m.team_b_name,
++                   m.best_of, m.match_datetime, e.name
++            FROM matches m LEFT JOIN events e ON e.id = m.event_id
++            WHERE m.score_a IS NULL
++              AND m.team_a_id IS NOT NULL AND m.team_b_id IS NOT NULL
++        """)).all()
++        for mid, ta_id, tb_id, ta, tb, bo, dt, event in rows:
++            stats["upcoming"] += 1
++            if session.get(Prediction, mid):
++                stats["skipped"] += 1
++                continue
++            res = predict_asof(session, ta_id, tb_id, bo or 3, now)
++            if res is None:
++                stats["skipped"] += 1
++                continue
++            _store(session, match_id=mid, ta_id=ta_id, tb_id=tb_id, ta=ta, tb=tb,
++                   event=event, dt=dt, bo=bo, res=res, source="live", predicted_at=now)
++            stats["predicted"] += 1
++        session.commit()
++        return stats
++    finally:
++        session.close()
++
++
++def link_results() -> dict:
++    """Fill actual result + correctness for predictions whose match completed."""
++    stats = {"linked": 0}
++    session = get_session()
++    try:
++        preds = session.execute(
++            sql_text("SELECT match_id FROM predictions WHERE correct IS NULL")
++        ).all()
++        for (mid,) in preds:
++            m = session.execute(sql_text("""
++                SELECT team_a_name, team_b_name, score_a, score_b, match_datetime
++                FROM matches WHERE id = :mid
++            """), {"mid": mid}).first()
++            if m is None or m[2] is None or m[3] is None:
++                continue
++            ta, tb, sa, sb, dt = m
++            p = session.get(Prediction, mid)
++            if p is None:
++                continue
++            aw = ta if sa > sb else tb
++            p.actual_score_a, p.actual_score_b = sa, sb
++            p.actual_winner = aw
++            p.correct = (p.predicted_winner == aw)
++            p.completed_at = dt or datetime.utcnow()
++            stats["linked"] += 1
++        session.commit()
++        return stats
++    finally:
++        session.close()
+diff --git a/src/vlr/scraping/pipeline.py b/src/vlr/scraping/pipeline.py
+index fd5beca..2aee5ef 100644
+--- a/src/vlr/scraping/pipeline.py
++++ b/src/vlr/scraping/pipeline.py
+@@ -86,6 +86,34 @@ def fetch_event_matches(event_id: int) -> list[MatchListing]:
+     return parse_results_listing(html, base_url=settings.vlr_base_url)
+ 
+ 
++def fetch_upcoming_page(page: int = 1) -> list[MatchListing]:
++    """vlr's upcoming/scheduled matches (the /matches feed, not /matches/results)."""
++    if page == 1:
++        url = f"{settings.vlr_base_url}/matches"
++    else:
++        url = f"{settings.vlr_base_url}/matches/?page={page}"
++    html = fetch(url)
++    return parse_results_listing(html, base_url=settings.vlr_base_url)
++
++
++def scrape_upcoming(pages: int = 1) -> int:
++    """Ingest upcoming matches (teams + scheduled time, null scores) so the
++    predictor can call them before they're played. Skips existing; best-effort."""
++    listings: list[MatchListing] = []
++    for p in range(1, pages + 1):
++        try:
++            listings.extend(fetch_upcoming_page(p))
++        except HttpError as exc:
++            log.error("Failed to fetch upcoming page %d: %s", p, exc)
++    if not listings:
++        return 0
++    try:
++        return _scrape_listings(listings, f"{len(listings)} upcoming match(es)").get("ok", 0)
++    except Exception:
++        log.exception("scrape_upcoming failed")
++        return 0
++
++
+ def fetch_and_parse_match(url: str) -> MatchDetail:
+     html = fetch(url)
+     return parse_match_detail(html, match_url=url)
+@@ -930,5 +958,20 @@ def run_full_refresh(pages: int = 1) -> dict:
+         log.exception("full-refresh: tier classify failed")
+         result["events_reclassified"] = 0
+ 
++    # Prediction track record: pull upcoming matches, predict them, and link
++    # results for any predicted match that has since completed.
++    try:
++        result["upcoming_scraped"] = scrape_upcoming()
++    except Exception:
++        log.exception("full-refresh: scrape upcoming failed")
++        result["upcoming_scraped"] = 0
++
++    try:
++        from ..ml.track_record import link_results, predict_upcoming
++        result["predictions_made"] = predict_upcoming()
++        result["predictions_linked"] = link_results()
++    except Exception:
++        log.exception("full-refresh: predictions failed")
++
+     log.info("full-refresh complete: %s", result)
+     return result
+diff --git a/web/app/track-record/page.tsx b/web/app/track-record/page.tsx
+new file mode 100644
+index 0000000..6bbb19b
+--- /dev/null
++++ b/web/app/track-record/page.tsx
+@@ -0,0 +1,252 @@
++'use client';
++
++import { useEffect, useState } from 'react';
++import { motion } from 'framer-motion';
++import {
++  BarChart, Bar, XAxis, YAxis, Tooltip, CartesianGrid, ResponsiveContainer, ReferenceLine, Cell,
++} from 'recharts';
++import { Check, X, Clock, TrendingUp } from 'lucide-react';
++import { api, type PredictionItem, type PredictionAccuracy } from '@/lib/api';
++import { TeamLogo } from '@/components/ui/avatar';
++import { cn } from '@/lib/utils';
++
++const AXIS = '#71717a';
++const GRID = '#27272a';
++const ACCENT = '#FA4454';
++
++type Tab = 'upcoming' | 'results';
++
++function pct(item: PredictionItem): number {
++  return Math.round(Math.max(item.prob_a, item.prob_b) * 100);
++}
++
++function when(iso: string | null): string {
++  if (!iso) return 'TBD';
++  const t = new Date(iso).getTime();
++  if (Number.isNaN(t)) return 'TBD';
++  const diff = t - Date.now();
++  const h = Math.round(Math.abs(diff) / 3.6e6);
++  if (h < 1) return diff >= 0 ? 'soon' : 'just now';
++  if (h < 24) return diff >= 0 ? `in ${h}h` : `${h}h ago`;
++  const d = Math.round(h / 24);
++  return diff >= 0 ? `in ${d}d` : `${d}d ago`;
++}
++
++function AccCard({ label, value, sub, accent }: { label: string; value: string; sub?: string; accent?: boolean }) {
++  return (
++    <div className={cn('rounded-2xl p-4 border', accent ? 'bg-accent/5 border-accent/30' : 'bg-surface border-border')}>
++      <div className="text-[0.65rem] uppercase tracking-widest text-ink-dim mb-1">{label}</div>
++      <div className={cn('font-mono text-2xl font-semibold tabular', accent ? 'text-accent' : 'text-ink')}>{value}</div>
++      {sub && <div className="text-[0.7rem] text-ink-dim mt-0.5">{sub}</div>}
++    </div>
++  );
++}
++
++export default function TrackRecordPage() {
++  const [acc, setAcc] = useState<PredictionAccuracy | null>(null);
++  const [upcoming, setUpcoming] = useState<PredictionItem[]>([]);
++  const [results, setResults] = useState<PredictionItem[]>([]);
++  const [tab, setTab] = useState<Tab>('upcoming');
++  const [source, setSource] = useState<'' | 'live' | 'backtest'>('');
++  const [loading, setLoading] = useState(true);
++
++  useEffect(() => {
++    Promise.all([
++      api.predictionsAccuracy().catch(() => null),
++      api.predictionsUpcoming(50).catch(() => [] as PredictionItem[]),
++    ])
++      .then(([a, u]) => {
++        setAcc(a);
++        setUpcoming(u);
++        if (u.length === 0) setTab('results');
++      })
++      .finally(() => setLoading(false));
++  }, []);
++
++  useEffect(() => {
++    if (tab !== 'results') return;
++    api.predictionsResults(source, 100).then(setResults).catch(() => setResults([]));
++  }, [tab, source]);
++
++  const hasData = !!acc && (acc.overall.n > 0 || upcoming.length > 0);
++
++  return (
++    <div className="max-w-6xl mx-auto px-6 lg:px-8 py-16">
++      <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }}>
++        <div className="flex items-center gap-2 text-[0.7rem] font-medium uppercase tracking-widest text-ink-dim mb-3">
++          <TrendingUp className="w-3.5 h-3.5 text-accent" />
++          Track record
++        </div>
++        <h1 className="text-display font-semibold tracking-tight text-gradient">Our calls vs reality.</h1>
++        <p className="mt-4 text-base text-ink-soft max-w-2xl">
++          The model&apos;s prediction on real vlr matches, scored against what actually happened.
++        </p>
++      </motion.div>
++
++      {!loading && !hasData && (
++        <div className="mt-8 bg-surface border border-border rounded-2xl p-8 text-center">
++          <div className="text-ink font-medium mb-1">No predictions yet</div>
++          <code className="mt-2 inline-block bg-bg border border-border rounded-lg px-3 py-2 text-xs text-ink-soft font-mono">
++            python -m src.vlr.cli backtest-predictions --limit 200
++          </code>
++        </div>
++      )}
++
++      {hasData && acc && (
++        <>
++          {/* Accuracy headline */}
++          <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 0.1 }}
++            className="mt-8 grid grid-cols-2 md:grid-cols-4 gap-3">
++            <AccCard label="Live hit-rate" accent value={acc.live.n ? `${acc.live.hit_rate}%` : '—'}
++              sub={acc.live.n ? `${acc.live.correct} / ${acc.live.n} correct` : 'fills as matches finish'} />
++            <AccCard label="Backtest hit-rate" value={acc.backtest.n ? `${acc.backtest.hit_rate}%` : '—'}
++              sub={acc.backtest.n ? `${acc.backtest.correct} / ${acc.backtest.n} correct` : '—'} />
++            <AccCard label="Overall" value={acc.overall.n ? `${acc.overall.hit_rate}%` : '—'} sub={`${acc.overall.n} calls scored`} />
++            <AccCard label="Pending" value={`${upcoming.length}`} sub="awaiting results" />
++          </motion.div>
++
++          {/* Tabs */}
++          <div className="mt-8 flex flex-wrap items-center justify-between gap-4">
++            <div className="flex gap-1 p-1 bg-surface border border-border rounded-xl">
++              {(['upcoming', 'results'] as Tab[]).map((t) => (
++                <button key={t} onClick={() => setTab(t)}
++                  className={cn('px-4 py-1.5 text-sm font-medium rounded-lg transition-all capitalize',
++                    tab === t ? 'bg-accent text-white shadow-lg shadow-accent/20' : 'text-ink-soft hover:text-ink hover:bg-surface-hover')}>
++                  {t}
++                </button>
++              ))}
++            </div>
++            {tab === 'results' && (
++              <div className="flex gap-1 p-1 bg-surface border border-border rounded-xl text-xs">
++                {([['', 'All'], ['live', 'Live'], ['backtest', 'Backtest']] as const).map(([v, label]) => (
++                  <button key={v} onClick={() => setSource(v)}
++                    className={cn('px-3 py-1 rounded-md transition-colors', source === v ? 'bg-surface-hover text-ink' : 'text-ink-dim hover:text-ink')}>
++                    {label}
++                  </button>
++                ))}
++              </div>
++            )}
++          </div>
++
++          {/* Upcoming */}
++          {tab === 'upcoming' && (
++            <motion.div initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} className="mt-4 grid md:grid-cols-2 gap-3">
++              {upcoming.length === 0 && (
++                <div className="md:col-span-2 text-center text-sm text-ink-dim py-12 bg-surface border border-border rounded-2xl">
++                  No upcoming calls yet — they appear as the scheduler pulls vlr&apos;s schedule.
++                </div>
++              )}
++              {upcoming.map((p) => {
++                const aFav = p.prob_a >= p.prob_b;
++                return (
++                  <div key={p.match_id} className="bg-surface border border-border rounded-2xl p-4">
++                    <div className="flex items-center justify-between text-[0.7rem] text-ink-dim mb-3">
++                      <span className="truncate">{p.event ?? 'Match'}</span>
++                      <span className="flex items-center gap-1"><Clock className="w-3 h-3" /> {when(p.scheduled_at)}</span>
++                    </div>
++                    <div className="flex items-center justify-between gap-2">
++                      <div className={cn('flex items-center gap-2 min-w-0', aFav ? 'text-ink' : 'text-ink-dim')}>
++                        <TeamLogo name={p.team_a} logoUrl={p.team_a_logo} size="sm" />
++                        <span className="font-semibold truncate">{p.team_a}</span>
++                      </div>
++                      <span className="text-ink-dim text-xs">vs</span>
++                      <div className={cn('flex items-center gap-2 min-w-0 justify-end', !aFav ? 'text-ink' : 'text-ink-dim')}>
++                        <span className="font-semibold truncate">{p.team_b}</span>
++                        <TeamLogo name={p.team_b} logoUrl={p.team_b_logo} size="sm" />
++                      </div>
++                    </div>
++                    <div className="mt-3 h-1.5 rounded-full overflow-hidden flex bg-bg">
++                      <div style={{ width: `${p.prob_a * 100}%`, background: ACCENT }} />
++                      <div style={{ width: `${p.prob_b * 100}%`, background: '#3f3f46' }} />
++                    </div>
++                    <div className="mt-2 text-xs text-ink-soft">
++                      Pick: <span className="text-ink font-semibold">{p.predicted_winner}</span>{' '}
++                      <span className="font-mono">{pct(p)}%</span>
++                      <span className="text-ink-dim"> · {p.confidence}</span>
++                    </div>
++                  </div>
++                );
++              })}
++            </motion.div>
++          )}
++
++          {/* Results — scoreboard cards */}
++          {tab === 'results' && (
++            <motion.div initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} className="mt-4 space-y-2.5">
++              {results.length === 0 && (
++                <div className="text-center text-sm text-ink-dim py-12 bg-surface border border-border rounded-2xl">No scored predictions yet.</div>
++              )}
++              {results.map((p) => {
++                const aWon = (p.actual_score_a ?? 0) > (p.actual_score_b ?? 0);
++                return (
++                  <div key={p.match_id}
++                    className={cn('bg-surface border rounded-2xl p-4 border-l-[3px]',
++                      p.correct ? 'border-border border-l-emerald-400/70' : 'border-border border-l-rose-400/70')}>
++                    <div className="flex items-center gap-4">
++                      {/* Matchup */}
++                      <div className="flex-1 min-w-0">
++                        <div className="flex items-center gap-4">
++                          <div className={cn('flex items-center gap-2 min-w-0', aWon ? 'text-ink font-semibold' : 'text-ink-dim')}>
++                            <TeamLogo name={p.team_a} logoUrl={p.team_a_logo} size="sm" />
++                            <span className="truncate">{p.team_a}</span>
++                          </div>
++                          <span className="font-mono tabular text-lg text-ink shrink-0">
++                            {p.actual_score_a}<span className="text-ink-dim mx-0.5">–</span>{p.actual_score_b}
++                          </span>
++                          <div className={cn('flex items-center gap-2 min-w-0', !aWon ? 'text-ink font-semibold' : 'text-ink-dim')}>
++                            <TeamLogo name={p.team_b} logoUrl={p.team_b_logo} size="sm" />
++                            <span className="truncate">{p.team_b}</span>
++                          </div>
++                        </div>
++                        <div className="mt-1.5 text-xs text-ink-dim">
++                          predicted <span className="text-ink-soft font-medium">{p.predicted_winner}</span>{' '}
++                          <span className="font-mono">{pct(p)}%</span>
++                          {p.event ? <span> · {p.event}</span> : null}
++                          {p.source === 'backtest' ? <span className="text-ink-dim"> · backtest</span> : null}
++                        </div>
++                      </div>
++                      {/* Verdict */}
++                      <div className="shrink-0">
++                        {p.correct ? (
++                          <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-medium bg-emerald-400/10 text-emerald-400 border border-emerald-400/30">
++                            <Check className="w-3.5 h-3.5" /> correct
++                          </span>
++                        ) : (
++                          <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-medium bg-rose-400/10 text-rose-400 border border-rose-400/30">
++                            <X className="w-3.5 h-3.5" /> missed
++                          </span>
++                        )}
++                      </div>
++                    </div>
++                  </div>
++                );
++              })}
++            </motion.div>
++          )}
++
++          {/* Calibration */}
++          {acc.calibration.some((c) => c.n > 0) && (
++            <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 0.2 }}
++              className="mt-6 bg-surface border border-border rounded-2xl p-4">
++              <div className="text-sm font-semibold text-ink mb-3">Calibration — confidence vs actual win rate</div>
++              <div className="h-48">
++                <ResponsiveContainer>
++                  <BarChart data={acc.calibration} margin={{ top: 8, right: 10, bottom: 0, left: -10 }}>
++                    <CartesianGrid stroke={GRID} vertical={false} />
++                    <XAxis dataKey="band" stroke={AXIS} tick={{ fontSize: 11, fill: AXIS }} unit="%" />
++                    <YAxis stroke={AXIS} tick={{ fontSize: 11, fill: AXIS }} unit="%" domain={[0, 100]} />
++                    <ReferenceLine y={50} stroke={AXIS} strokeDasharray="3 3" />
++                    <Tooltip contentStyle={{ background: '#18181b', border: `1px solid ${GRID}`, borderRadius: 8, fontSize: 12 }} />
++                    <Bar dataKey="actual_win_rate" name="actual win %" radius={[3, 3, 0, 0]}>
++                      {acc.calibration.map((_, i) => <Cell key={i} fill={ACCENT} />)}
++                    </Bar>
++                  </BarChart>
++                </ResponsiveContainer>
++              </div>
++            </motion.div>
++          )}
++        </>
++      )}
++    </div>
++  );
++}
+diff --git a/web/components/layout/nav.tsx b/web/components/layout/nav.tsx
+index 983579e..903d44e 100644
+--- a/web/components/layout/nav.tsx
++++ b/web/components/layout/nav.tsx
+@@ -10,6 +10,7 @@ import { cn } from '@/lib/utils';
+ const navItems = [
+   { href: '/', label: 'Home' },
+   { href: '/predict', label: 'Predict' },
++  { href: '/track-record', label: 'Track Record' },
+   { href: '/match-analysis', label: 'Analysis' },
+   { href: '/fantasy', label: 'Fantasy' },
+   { href: '/pickem', label: "Pick'em" },
+diff --git a/web/lib/api.ts b/web/lib/api.ts
+index 076d437..c90d420 100644
+--- a/web/lib/api.ts
++++ b/web/lib/api.ts
+@@ -458,6 +458,36 @@ export interface VctGameRounds {
+   rounds?: VctRoundDetail[];
+ }
+ 
++// Prediction track record
++export interface PredictionItem {
++  match_id: number;
++  team_a: string;
++  team_b: string;
++  team_a_logo: string | null;
++  team_b_logo: string | null;
++  event: string | null;
++  scheduled_at: string | null;
++  best_of: number | null;
++  prob_a: number;
++  prob_b: number;
++  predicted_winner: string;
++  confidence: string | null;
++  predicted_score_a: number | null;
++  predicted_score_b: number | null;
++  source: string;
++  actual_score_a: number | null;
++  actual_score_b: number | null;
++  actual_winner: string | null;
++  correct: boolean | null;
++}
++
++export interface PredictionAccuracy {
++  overall: { n: number; correct: number; hit_rate: number };
++  live: { n: number; correct: number; hit_rate: number };
++  backtest: { n: number; correct: number; hit_rate: number };
++  calibration: { band: string; n: number; actual_win_rate: number }[];
++}
++
+ // --- API methods --------------------------------------------------------
+ 
+ export const api = {
+@@ -563,6 +593,15 @@ export const api = {
+   abilitiesImpactMaps: () => request<MapImpact[]>('/api/v1/abilities/impact/maps'),
+   abilitiesImpactBreakdown: () =>
+     request<AbilityBreakdown>('/api/v1/abilities/impact/breakdown'),
++
++  // Prediction track record
++  predictionsUpcoming: (limit = 50) =>
++    request<PredictionItem[]>(`/api/v1/predictions/upcoming?limit=${limit}`),
++  predictionsResults: (source = '', limit = 80) =>
++    request<PredictionItem[]>(
++      `/api/v1/predictions/results?source=${encodeURIComponent(source)}&limit=${limit}`,
++    ),
++  predictionsAccuracy: () => request<PredictionAccuracy>('/api/v1/predictions/accuracy'),
+   abilitiesGames: (opts: { map?: string; search?: string; limit?: number } = {}) =>
+     request<VctGameListItem[]>(
+       `/api/v1/abilities/games?map=${encodeURIComponent(opts.map ?? '')}&search=${encodeURIComponent(

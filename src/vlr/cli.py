@@ -95,6 +95,22 @@ def import_vct_abilities_cmd(
 
     result = import_vct_games(tier, year, limit=limit, on_progress=_prog)
     console.print(f"[bold green]VCT import done[/]: {result}")
+
+
+@app.command("backtest-predictions")
+def backtest_predictions_cmd(
+    limit: int = typer.Option(200, help="most recent completed matches to score"),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
+    """Score the model on recent completed vlr matches (point-in-time) to seed
+    the Track Record with immediate accuracy numbers.
+
+        python -m src.vlr.cli backtest-predictions --limit 200
+    """
+    _configure_logging(verbose)
+    from .ml.track_record import backtest_recent
+    result = backtest_recent(limit=limit)
+    console.print(f"[bold green]Backtest done[/]: {result}")
     console.print("[green]Schema created and migrations applied.[/green]")
 
     # Check whether tier classifications are missing — common after a 7b upgrade
