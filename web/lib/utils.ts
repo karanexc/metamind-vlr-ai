@@ -57,3 +57,23 @@ export function initials(name: string): string {
   if (!name) return '?';
   return name.slice(0, 2).toUpperCase();
 }
+
+/**
+ * Route a vlr image-CDN URL through our own same-origin /api/img proxy.
+ *
+ * Team logos and player photos live on owcdn.net (behind CloudFront), which
+ * 403s hotlinked <img> loads coming from another origin. The block is on the
+ * browser's Sec-Fetch-Dest/Sec-Fetch-Site headers — set by the browser and
+ * impossible to strip from the page — so the only fix is to fetch the image
+ * server-side. The proxy does that and re-serves it from our origin.
+ *
+ * Only owcdn URLs are rewritten; game assets (valorant-api.com), relative
+ * paths and data: URLs are returned untouched.
+ */
+export function proxyImage(url?: string | null): string | undefined {
+  if (!url) return undefined;
+  if (/^https?:\/\/([a-z0-9-]+\.)*owcdn\.net\//i.test(url)) {
+    return `/api/img?u=${encodeURIComponent(url)}`;
+  }
+  return url;
+}

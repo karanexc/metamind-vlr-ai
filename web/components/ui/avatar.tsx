@@ -1,7 +1,7 @@
 'use client';
 
 import { useState } from 'react';
-import { avatarColor, initials, countryFlag, cn } from '@/lib/utils';
+import { avatarColor, initials, countryFlag, cn, proxyImage } from '@/lib/utils';
 
 interface PlayerAvatarProps {
   name: string;
@@ -50,7 +50,7 @@ export function PlayerAvatar({
     <div className={cn('relative inline-block', SIZE_CLASSES[size], className)}>
       {showImage ? (
         <img
-          src={imageUrl!}
+          src={proxyImage(imageUrl)}
           alt={name}
           className="w-full h-full rounded-full object-cover bg-bg"
           onError={() => setImgFailed(true)}
@@ -112,7 +112,7 @@ export function TeamLogo({ name, logoUrl, size = 'md', className }: TeamLogoProp
     >
       {showImage ? (
         <img
-          src={logoUrl!}
+          src={proxyImage(logoUrl)}
           alt={name}
           className="w-full h-full object-contain"
           onError={() => setImgFailed(true)}

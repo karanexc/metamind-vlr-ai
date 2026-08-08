@@ -17,7 +17,7 @@ import { Select } from '@/components/ui/select';
 import { StatTile } from '@/components/ui/stat-tile';
 import { PlayerAvatar, TeamLogo } from '@/components/ui/avatar';
 import { Skeleton } from '@/components/ui/skeleton';
-import { cn, countryFlag } from '@/lib/utils';
+import { cn, countryFlag, proxyImage } from '@/lib/utils';
 import { VLR_REGIONS } from '@/lib/regions';
 
 const REGIONS = VLR_REGIONS.map((r) => ({ value: r.slug, label: r.label }));
@@ -233,7 +233,7 @@ export default function PlayersPage() {
                     <div className="aspect-square relative bg-gradient-to-br from-surface to-bg flex items-center justify-center">
                       {p.image_url ? (
                         <img
-                          src={p.image_url}
+                          src={proxyImage(p.image_url)}
                           alt={p.name}
                           className="w-full h-full object-cover"
                           loading="lazy"
