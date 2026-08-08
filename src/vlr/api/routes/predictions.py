@@ -1,8 +1,10 @@
 """Prediction track record — the model's calls vs actual results (live vlr)."""
 from __future__ import annotations
 
+from datetime import datetime, timedelta
+
 from fastapi import APIRouter, Query
-from sqlalchemy import select
+from sqlalchemy import or_, select
 
 from vlr.db.models import Prediction, Team
 from vlr.db.session import get_session
@@ -42,11 +44,21 @@ def _row(p: Prediction, logos: dict) -> dict:
 
 @router.get("/predictions/upcoming")
 async def predictions_upcoming(limit: int = Query(50, ge=1, le=200)) -> list[dict]:
-    """Matches the model has called but that haven't been played/scored yet."""
+    """Matches the model has called but that haven't been played/scored yet.
+
+    Only genuinely-upcoming matches are returned. Predictions whose scheduled
+    time is already well in the past are stale — their match was played but the
+    result was never scraped back in — so we hide them here instead of letting
+    them clutter the tab. (predict_upcoming applies the same floor going forward.)
+    """
     session = get_session()
     try:
+        cutoff = datetime.utcnow() - timedelta(hours=12)
         rows = session.execute(
-            select(Prediction).where(Prediction.correct.is_(None))
+            select(Prediction).where(
+                Prediction.correct.is_(None),
+                or_(Prediction.scheduled_at.is_(None), Prediction.scheduled_at >= cutoff),
+            )
             .order_by(Prediction.scheduled_at.asc().nullslast())
             .limit(limit)
         ).scalars().all()

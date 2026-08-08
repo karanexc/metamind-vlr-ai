@@ -13,7 +13,7 @@ All on the live vlr dataset. Nothing here touches the VCT (2022-24) data.
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 from sqlalchemy import text as sql_text
@@ -136,13 +136,20 @@ def predict_upcoming() -> dict:
     session = get_session()
     try:
         now = datetime.utcnow()
+        # Only predict genuinely-upcoming matches. Without a lower time bound we
+        # also re-predict matches that were ingested as "upcoming" (null score)
+        # but whose result was never scraped back in — they'd pile up as stale
+        # entries in the Upcoming tab forever. The 12h grace keeps matches that
+        # are live/just-started (score not written yet) in scope.
+        cutoff = now - timedelta(hours=12)
         rows = session.execute(sql_text("""
             SELECT m.id, m.team_a_id, m.team_b_id, m.team_a_name, m.team_b_name,
                    m.best_of, m.match_datetime, e.name
             FROM matches m LEFT JOIN events e ON e.id = m.event_id
             WHERE m.score_a IS NULL
               AND m.team_a_id IS NOT NULL AND m.team_b_id IS NOT NULL
-        """)).all()
+              AND (m.match_datetime IS NULL OR m.match_datetime >= :cutoff)
+        """), {"cutoff": cutoff}).all()
         for mid, ta_id, tb_id, ta, tb, bo, dt, event in rows:
             stats["upcoming"] += 1
             if session.get(Prediction, mid):
