@@ -10,6 +10,12 @@ export const metadata: Metadata = {
   title: 'VLR Analytics — Valorant match intelligence',
   description:
     'Match prediction, performance analysis, and roster intelligence for competitive Valorant. Built on every Tier 1 and Challengers match since 2024.',
+  // vlr's image CDN (owcdn.net) returns 403 for any request carrying a foreign
+  // Referer header. Team logos and player photos are served from there, so in
+  // production the browser's Referer (the Vercel origin) got them blocked.
+  // Emitting <meta name="referrer" content="no-referrer"> site-wide strips the
+  // Referer from every subresource request, so the CDN serves the images (200).
+  referrer: 'no-referrer',
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
